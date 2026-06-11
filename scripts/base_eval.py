@@ -22,7 +22,14 @@ from contextlib import nullcontext
 
 import torch
 
+from enum_actions import enum_action
+
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
+try:
+    import rust_ewma
+except ImportError:
+    rust_ewma = None
+from nanochat.gpt_factory import LtvSplitMode, ModelType, one_time_model_factory
 from nanochat.tokenizer import HuggingFaceTokenizer
 from nanochat.checkpoint_manager import load_model
 from nanochat.core_eval import evaluate_task
@@ -149,14 +156,19 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--hf-path', type=str, default=None, help='HuggingFace model path to evaluate')
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per task to evaluate (-1 = disable)')
-    parser.add_argument('--model-tag', type=str, default=None, help='optional model tag for the output directory name')
+    parser.add_argument('--model-tag', '--model_tag', type=str, default=None, help='optional model tag for the output directory name')
     parser.add_argument('--step', type=str, default=None, help='optional model step for the output directory name')
+    parser.add_argument('--model_type', action=enum_action(ModelType), default=ModelType.ORIGINAL)
+    parser.add_argument('--ltv_query', action=enum_action(LtvSplitMode), default=LtvSplitMode.NONE)
+    parser.add_argument('--ltv_key', action=enum_action(LtvSplitMode), default=LtvSplitMode.NONE)
+    parser.add_argument('--ltv_value', action=enum_action(LtvSplitMode), default=LtvSplitMode.NONE)
+    parser.add_argument("--report_name", type=str, default="report")
     args = parser.parse_args()
 
     # distributed / precision setup
     device_type = autodetect_device_type()
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
-    autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
+    autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type in ["cuda", "mps"] else nullcontext()
 
     # Load model and tokenizer from command line or from file system
     if args.hf_path is not None:
@@ -168,7 +180,14 @@ def main():
         model_slug = hf_path.replace("/", "-") # for the output csv file
     else:
         # load a local model from the file system
-        model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step)
+        model, tokenizer, meta = load_model(
+            one_time_model_factory(args.model_type, args.ltv_query, args.ltv_key, args.ltv_value),
+            "base",
+            device,
+            phase="eval",
+            model_tag=args.model_tag,
+            step=args.step,
+        )
         model_name = f"base_model (step {meta['step']})" # just for logging
         model_slug = f"base_model_{meta['step']:06d}" # for the output csv file
 
@@ -200,7 +219,7 @@ def main():
 
     # Log to report
     from nanochat.report import get_report
-    get_report().log(section="Base model evaluation", data=[
+    get_report(args.report_name).log(section="Base model evaluation", data=[
         {
             "Model": model_name,
             "CORE metric": core_metric,

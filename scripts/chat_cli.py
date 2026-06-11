@@ -5,21 +5,31 @@ Intended to be run single GPU only atm:
 python -m scripts.chat_cli -i mid
 """
 import argparse
+from enum_actions import enum_action
 import torch
 from nanochat.common import compute_init, autodetect_device_type
 from contextlib import nullcontext
 from nanochat.engine import Engine
 from nanochat.checkpoint_manager import load_model
+try:
+    import rust_ewma
+except ImportError:
+    rust_ewma = None
+from nanochat.gpt_factory import LtvSplitMode, ModelType, one_time_model_factory
 
 parser = argparse.ArgumentParser(description='Chat with the model')
 parser.add_argument('-i', '--source', type=str, default="sft", help="Source of the model: sft|mid|rl")
-parser.add_argument('-g', '--model-tag', type=str, default=None, help='Model tag to load')
+parser.add_argument('-g', '--model-tag', '--model_tag', type=str, default=None, help='Model tag to load')
 parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
 parser.add_argument('-p', '--prompt', type=str, default='', help='Prompt the model, get a single response back')
 parser.add_argument('-t', '--temperature', type=float, default=0.6, help='Temperature for generation')
 parser.add_argument('-k', '--top-k', type=int, default=50, help='Top-k sampling parameter')
 parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
 parser.add_argument('-d', '--dtype', type=str, default='bfloat16', choices=['float32', 'bfloat16'])
+parser.add_argument('--model_type', action=enum_action(ModelType), default=ModelType.ORIGINAL)
+parser.add_argument('--ltv_query', action=enum_action(LtvSplitMode), default=LtvSplitMode.NONE)
+parser.add_argument('--ltv_key', action=enum_action(LtvSplitMode), default=LtvSplitMode.NONE)
+parser.add_argument('--ltv_value', action=enum_action(LtvSplitMode), default=LtvSplitMode.NONE)
 args = parser.parse_args()
 
 # Init the model and tokenizer
@@ -27,8 +37,17 @@ args = parser.parse_args()
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 ptdtype = torch.float32 if args.dtype == 'float32' else torch.bfloat16
-autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
-model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
+autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type in ["cuda", "mps"] else nullcontext()
+model, tokenizer, meta = load_model(
+    one_time_model_factory(
+        args.model_type, args.ltv_query, args.ltv_key, args.ltv_value
+    ),
+    args.source,
+    device,
+    phase="eval",
+    model_tag=args.model_tag,
+    step=args.step,
+)
 
 # Special tokens for the chat state machine
 bos = tokenizer.get_bos_token_id()

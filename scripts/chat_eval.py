@@ -11,13 +11,21 @@ torchrun --nproc_per_node=8 -m scripts.chat_eval -- -a ARC-Easy
 import argparse
 from functools import partial
 from contextlib import nullcontext
+import pathlib
 
+from enum_actions import enum_action
 import torch
 import torch.distributed as dist
 
 from nanochat.common import compute_init, compute_cleanup, get_dist_info, print0, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
 from nanochat.engine import Engine
+try:
+    import rust_ewma
+except ImportError:
+    rust_ewma = None
+from nanochat.gpt_factory import LtvSplitMode, ModelType, one_time_model_factory
+from nanochat.train_utils import sleep_if_paused
 
 from tasks.humaneval import HumanEval
 from tasks.mmlu import MMLU
@@ -35,9 +43,12 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
 
     num_problems = len(task_object) if max_problems is None else min(len(task_object), max_problems)
 
+    pause_file = pathlib.Path("/tmp/generative_eval.pause")
     # Run the evaluation
     num_passed, total = 0, 0
     for i in range(ddp_rank, num_problems, ddp_world_size):
+        sleep_if_paused(pause_file)
+
         conversation = task_object[i]
 
         # Tokenize the prompt
@@ -98,10 +109,14 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
     ceil_div = lambda x, y: -(-x // y)
     num_batches = ceil_div(num_problems, batch_size)
 
+    pause_file = pathlib.Path("/tmp/categorical_eval.pause")
+
     # Run the evaluation
     letter_to_id_cache = {} # many letters will repeat often, let's save the tokenizer some work
     num_passed, total = 0, 0
     for i in range(ddp_rank, num_batches, ddp_world_size):
+        sleep_if_paused(pause_file)
+
         i0, i1 = i * batch_size, min((i + 1) * batch_size, num_problems)
 
         # Prepare the batch of problems. They might all be of different length, so we pad/collate them.
@@ -191,18 +206,30 @@ if __name__ == "__main__":
     parser.add_argument('-n', '--num-samples', type=int, default=1)
     parser.add_argument('-k', '--top-k', type=int, default=50)
     parser.add_argument('-b', '--batch-size', type=int, default=8, help='Batch size for categorical evaluation')
-    parser.add_argument('-g', '--model-tag', type=str, default=None, help='Model tag to load')
+    parser.add_argument('-g', '--model-tag', '--model_tag', type=str, default=None, help='Model tag to load')
     parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
     parser.add_argument('-x', '--max-problems', type=int, default=None, help='Max problems to evaluate')
     parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
+    parser.add_argument('--model_type', action=enum_action(ModelType), default=ModelType.ORIGINAL)
+    parser.add_argument('--ltv_query', action=enum_action(LtvSplitMode), default=LtvSplitMode.NONE)
+    parser.add_argument('--ltv_key', action=enum_action(LtvSplitMode), default=LtvSplitMode.NONE)
+    parser.add_argument('--ltv_value', action=enum_action(LtvSplitMode), default=LtvSplitMode.NONE)
+    parser.add_argument("--report_name", type=str, default="report")
     args = parser.parse_args()
 
     device_type = autodetect_device_type() if args.device_type == "" else args.device_type
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
     ptdtype = torch.float32 if args.dtype == 'float32' else torch.bfloat16
-    autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
+    autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type in ["cuda", "mps"] else nullcontext()
 
-    model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
+    model, tokenizer, meta = load_model(
+        one_time_model_factory(args.model_type, args.ltv_query, args.ltv_key, args.ltv_value),
+        args.source,
+        device,
+        phase="eval",
+        model_tag=args.model_tag,
+        step=args.step,
+    )
     engine = Engine(model, tokenizer)
 
     # Get the tasks to evaluate on
@@ -248,7 +275,7 @@ if __name__ == "__main__":
             centered_mean += centered_acc
         chatcore_metric = centered_mean / len(results)
         chatcore_metric_dict = {"ChatCORE metric": chatcore_metric}
-    get_report().log(section="Chat evaluation " + args.source, data=[
+    get_report(args.report_name).log(section="Chat evaluation " + args.source, data=[
         vars(args), # CLI args
         results,
         chatcore_metric_dict,

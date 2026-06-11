@@ -1,0 +1,130 @@
+#pragma once
+#include <metal_stdlib>
+using namespace metal;
+
+template <typename T>
+inline void blelloch_affine_scan(
+    threadgroup T* b_alpha,
+    threadgroup T* b_x,
+    threadgroup T& chunk_total_a,
+    threadgroup T& chunk_total_x,
+    uint tid,
+    bool group_is_uniform,
+    uint chunk_size,
+    uint c
+) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // --- Phase 1: UP-SWEEP ---
+    uint s = 1;
+    uint k = tid + 1;
+    while (s < chunk_size) {
+        uint sc_step = s * c;
+        bool is_active = (k <= chunk_size / s);
+        uint lane = (k - 1) % c;
+
+        T val_a = 1.0;
+        T val_x = 0.0;
+        if (is_active) {
+            val_a = b_alpha[BANK_IDX(s * k - 1)];
+            val_x = b_x[BANK_IDX(s * k - 1)];
+        }
+
+        if (group_is_uniform) {
+            for (uint off = 1; off < c; off <<= 1) {
+                T oa = simd_shuffle_down(val_a, off);
+                T ox = simd_shuffle_down(val_x, off);
+                if (lane + off < c) {
+                    val_x = oa * val_x + ox;
+                    val_a = oa * val_a;
+                }
+            }
+            if (is_active && lane == 0) {
+                uint _k = ((k - 1) / c + 1) * c;
+                b_alpha[BANK_IDX(s * _k - 1)] = val_a;
+                b_x[BANK_IDX(s * _k - 1)]     = val_x;
+            }
+        } else {
+            if (is_active && lane == 0) {
+                uint _k = ((k - 1) / c + 1) * c;
+                T sa = 1.0, sx = 0.0;
+                for (int j = c - 1; j >= 0; --j) {
+                    T ca = b_alpha[BANK_IDX(s * (_k - j) - 1)];
+                    T cx = b_x[BANK_IDX(s * (_k - j) - 1)];
+                    sx = ca * sx + cx;
+                    sa = ca * sa;
+                }
+                b_alpha[BANK_IDX(s * _k - 1)] = sa;
+                b_x[BANK_IDX(s * _k - 1)]     = sx;
+            }
+        }
+        
+        s = sc_step;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Save chunk total
+    if (tid == chunk_size - 1) {
+        chunk_total_a = b_alpha[BANK_IDX(chunk_size - 1)];
+        chunk_total_x = b_x[BANK_IDX(chunk_size - 1)];
+        b_alpha[BANK_IDX(chunk_size - 1)] = 1.0;
+        b_x[BANK_IDX(chunk_size - 1)]     = 0.0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // --- Phase 2: DOWN-SWEEP ---
+    s = c > 1 ? chunk_size / c : 0;
+    while (s >= 1) {
+        bool is_active = (k <= chunk_size / s);
+        uint lane = (k - 1) % c;
+
+        T fa = 1.0, fx = 0.0;
+
+        if (is_active) {
+            uint _k = ((k - 1) / c + 1) * c;
+            T pa = b_alpha[BANK_IDX(s * _k - 1)];
+            T px = b_x[BANK_IDX(s * _k - 1)];
+
+            T va = b_alpha[BANK_IDX(s * k - 1)];
+            T vx = b_x[BANK_IDX(s * k - 1)];
+
+            T ea = 1.0, ex = 0.0;
+
+            if (group_is_uniform) {
+                for (uint off = 1; off < c; off <<= 1) {
+                    T oa = simd_shuffle_up(va, off);
+                    T ox = simd_shuffle_up(vx, off);
+                    if (lane >= off) {
+                        vx = va * ox + vx;
+                        va = va * oa;
+                    }
+                }
+                if (lane > 0) {
+                    ea = simd_shuffle_up(va, 1);
+                    ex = simd_shuffle_up(vx, 1);
+                }
+            } else {
+                for (int j = 0; j < (int)lane; ++j) {
+                    uint idx = s * (_k - c + j + 1) - 1;
+                    T ca = b_alpha[BANK_IDX(idx)];
+                    T cx = b_x[BANK_IDX(idx)];
+                    ex = ca * ex + cx;
+                    ea = ca * ea;
+                }
+            }
+
+            fa = ea * pa;
+            fx = ea * px + ex;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (is_active) {
+            b_alpha[BANK_IDX(s * k - 1)] = fa;
+            b_x[BANK_IDX(s * k - 1)]     = fx;
+        }
+
+        s /= c;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}

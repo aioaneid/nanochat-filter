@@ -1,0 +1,222 @@
+#include "ltv_blelloch_affine_scan.mslh"
+
+template <typename T_in, typename T_compute, typename T_out>
+kernel void ltv_fused_concat_register_cast_blelloch_scan_backward(
+    device const T_in* combined      [[buffer(0)]],
+    device const T_in* inits         [[buffer(1)]],
+
+    device const T_out* hq           [[buffer(2)]],
+    device const T_out* hk           [[buffer(3)]],
+    device const T_out* hv           [[buffer(4)]],
+
+    device const T_out* grad_hq      [[buffer(5)]],
+    device const T_out* grad_hk      [[buffer(6)]],
+    device const T_out* grad_hv      [[buffer(7)]],
+
+    device T_out* grad_combined      [[buffer(8)]],
+    device T_out* grad_inits         [[buffer(9)]],
+    device atomic<float>* grad_logits [[buffer(10)]],
+
+    constant uint3& sc_in            [[buffer(11)]],
+    constant uint3& sc_out           [[buffer(12)]],
+    constant uint& B                 [[buffer(13)]],
+    constant uint& T_seq             [[buffer(14)]],
+    constant uint& NH                [[buffer(15)]],
+    constant uint& NKVH              [[buffer(16)]],
+    constant uint& Da                [[buffer(17)]],
+    constant uint& r                 [[buffer(18)]],
+    constant uint& chunk_size        [[buffer(19)]],
+    constant uint& c                 [[buffer(20)]],
+    constant bool& use_sigmoid       [[buffer(21)]],
+
+    threadgroup T_compute* b_alpha   [[threadgroup(0)]],
+    threadgroup T_compute* b_x       [[threadgroup(1)]],
+    threadgroup T_compute* b_g       [[threadgroup(2)]],
+
+    uint3 block_id [[threadgroup_position_in_grid]],
+    uint3 tid       [[thread_position_in_threadgroup]],
+    uint lane_id   [[thread_index_in_simdgroup]]
+) {
+    const uint b_idx  = block_id.x;
+    const uint h_glob = block_id.y;
+    const uint d_idx  = block_id.z;
+
+    const uint tid_idx = tid.x;
+
+    uint d_simd = tid_idx - lane_id;
+    bool group_is_uniform = (simd_sum(1u) == c) &&
+                            (simd_max(lane_id) - simd_min(lane_id) == c - 1) &&
+                            (simd_max(d_simd) == simd_min(d_simd)) &&
+                            (simd_min(tid_idx / c) == simd_max(tid_idx / c)) &&
+                            (simd_min(b_idx) == simd_max(b_idx)) &&
+                            (simd_min(h_glob) == simd_max(h_glob)) &&
+                            (simd_min(d_idx) == simd_max(d_idx));
+
+    const uint D = Da * r;
+    const uint total_h = NH + 2 * NKVH;
+    const uint da_idx = d_idx / r;
+
+    // -------------------------
+    // Head routing (same as forward)
+    // -------------------------
+    device const T_out* h_ptr;
+    device const T_out* grad_h_ptr;
+    uint h_loc, h_comp_total, offset_in_row;
+
+    if (h_glob < NH) {
+        h_ptr = hq;
+        grad_h_ptr = grad_hq;
+        h_loc = h_glob;
+        h_comp_total = NH;
+        offset_in_row = 0;
+    } else if (h_glob < NH + NKVH) {
+        h_ptr = hk;
+        grad_h_ptr = grad_hk;
+        h_loc = h_glob - NH;
+        h_comp_total = NKVH;
+        offset_in_row = NH * D;
+    } else {
+        h_ptr = hv;
+        grad_h_ptr = grad_hv;
+        h_loc = h_glob - (NH + NKVH);
+        h_comp_total = NKVH;
+        offset_in_row = (NH + NKVH) * D;
+    }
+
+    const uint offset_l = total_h * D;
+
+    // Base pointers for input (combined) and output (grad_combined) indexing
+    const device T_in* q_val   = combined + (b_idx * sc_in.x) + (offset_in_row + h_loc * D + d_idx) * sc_in.z;
+    const device T_in* q_logit = combined + (b_idx * sc_in.x) + (offset_l + h_glob * Da + da_idx) * sc_in.z;
+    const uint base = b_idx * sc_out.x;
+
+    // Running backward state
+    T_compute running_g = 0.0;
+
+    threadgroup T_compute chunk_a;
+    threadgroup T_compute chunk_x;
+
+    int chunks = ((int)T_seq + (int)chunk_size - 1) / (int)chunk_size;
+    for (int chunk_idx = chunks - 1; chunk_idx >= 0; --chunk_idx) {
+        int t_base = chunk_idx * (int)chunk_size;
+        int t = t_base + (int)tid_idx;
+
+        T_compute a_i = 1.0;
+        T_compute a_next = 1.0;
+        T_compute alpha_gate = 0.0;
+        T_compute x_val = 0.0;
+        T_compute g_out = 0.0;
+
+        if (t >= 0 && t < (int)T_seq) {
+            x_val = (T_compute)q_val[t * sc_in.y];
+            T_compute l_raw = (T_compute)q_logit[t * sc_in.y];
+
+            alpha_gate = use_sigmoid
+                ? (1.0 / (1.0 + metal::exp(-l_raw)))
+                : l_raw;
+
+            a_i = 1.0 - alpha_gate;
+
+            if (t + 1 < (int)T_seq) {
+                T_compute l_raw_next = (T_compute)q_logit[(t + 1) * sc_in.y];
+                T_compute alpha_next = use_sigmoid
+                    ? (1.0 / (1.0 + metal::exp(-l_raw_next)))
+                    : l_raw_next;
+                a_next = 1.0 - alpha_next;
+            }
+
+            uint gh_idx =
+                b_idx * (h_comp_total * T_seq * D) +
+                h_loc * (T_seq * D) +
+                d_idx +
+                t * D;
+
+            g_out = (T_compute)grad_h_ptr[gh_idx];
+        }
+
+        uint rev = chunk_size - 1 - tid_idx;
+        b_alpha[BANK_IDX(rev)] = a_next;
+        b_x[BANK_IDX(rev)]     = g_out;
+
+        blelloch_affine_scan(
+            b_alpha, b_x,
+            chunk_a, chunk_x,
+            tid_idx, group_is_uniform,
+            chunk_size, c
+        );
+
+        if (t >= 0 && t < (int)T_seq) {
+            T_compute prefix_a = b_alpha[BANK_IDX(rev)];
+            T_compute prefix_x = b_x[BANK_IDX(rev)];
+            T_compute g_i = a_next * (prefix_a * running_g + prefix_x) + g_out;
+
+            T_compute h_prev;
+            if (t == 0) {
+                h_prev = (T_compute)inits[b_idx * (total_h * D) + h_glob * D + d_idx];
+            } else {
+                uint h_prev_idx = b_idx * (h_comp_total * T_seq * D) + h_loc * (T_seq * D) + d_idx + (t - 1) * D;
+                h_prev = (T_compute)h_ptr[h_prev_idx];
+            }
+
+            T_compute d_alpha = (x_val - h_prev) * g_i;
+            T_compute d_x = alpha_gate * g_i;
+            T_compute d_l = use_sigmoid ? d_alpha * alpha_gate * (1.0 - alpha_gate) : d_alpha;
+
+            uint val_out_idx = base + (offset_in_row + h_loc * D + d_idx) * sc_out.z + t * sc_out.y;
+            uint logit_out_idx = base + (offset_l + h_glob * Da + da_idx) * sc_out.z + t * sc_out.y;
+
+            grad_combined[val_out_idx] = (T_out)d_x;
+
+            if (r == 1) {
+                grad_combined[logit_out_idx] = (T_out)d_l;
+            } else {
+                uint logit_lin_idx =
+                    b_idx * (T_seq * total_h * Da) +
+                    t * (total_h * Da) +
+                    h_glob * Da +
+                    da_idx;
+                atomic_fetch_add_explicit(
+                    &grad_logits[logit_lin_idx],
+                    (float)d_l,
+                    memory_order_relaxed
+                );
+            }
+
+            if (t == 0) {
+                uint init_idx =
+                    b_idx * (total_h * D) +
+                    h_glob * D +
+                    d_idx;
+
+                grad_inits[init_idx] = (T_out)(g_i * a_i);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        running_g = chunk_a * running_g + chunk_x;
+    }
+}
+
+template [[host_name("ltv_fused_concat_register_cast_blelloch_scan_backward_bf16_f32_bf16")]]
+kernel void ltv_fused_concat_register_cast_blelloch_scan_backward<bfloat, float, bfloat>(
+    device const bfloat*, device const bfloat*,
+    device const bfloat*, device const bfloat*, device const bfloat*,
+    device const bfloat*, device const bfloat*, device const bfloat*,
+    device bfloat*, device bfloat*,
+    device atomic<float>*,
+    constant uint3&, constant uint3&, constant uint&, constant uint&, constant uint&, constant uint&, constant uint&, constant uint&, constant uint&, constant uint&, constant bool&,
+    threadgroup float*, threadgroup float*, threadgroup float*,
+    uint3, uint3, uint
+);
+
+template [[host_name("ltv_fused_concat_register_cast_blelloch_scan_backward_f32_f32_f32")]]
+kernel void ltv_fused_concat_register_cast_blelloch_scan_backward<float, float, float>(
+    device const float*, device const float*,
+    device const float*, device const float*, device const float*,
+    device const float*, device const float*, device const float*,
+    device float*, device float*,
+    device atomic<float>*,
+    constant uint3&, constant uint3&, constant uint&, constant uint&, constant uint&, constant uint&, constant uint&, constant uint&, constant uint&, constant uint&, constant bool&,
+    threadgroup float*, threadgroup float*, threadgroup float*,
+    uint3, uint3, uint
+);

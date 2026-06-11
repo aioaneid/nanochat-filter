@@ -1,0 +1,286 @@
+#include <metal_stdlib>
+using namespace metal;
+
+// Helper to calculate the base offsets used by both kernels
+struct Pointers {
+    device const float* x;
+    device const float* l;
+    device const float* tr;
+    uint h_fwd_off;
+};
+
+inline Pointers get_ptrs(
+    device const float* combined,
+    device const float* h_fwd_q, device const float* h_fwd_k, device const float* h_fwd_v,
+    device const float* go_q, device const float* go_k, device const float* go_v,
+    constant uint3& sc, constant uint4& sq, constant uint4& sk, constant uint4& sv,
+    uint b, uint h_glob, uint d, uint Da, uint r, uint T, uint NH, uint NKVH
+) {
+    const uint D = Da * r;
+    const uint total_h = NH + 2 * NKVH;
+    const uint da_idx = d / r;
+    const uint offset_l = total_h * D;
+    const uint last_t = T - 1;
+
+    device const float *h_ptr, *go_ptr;
+    uint h_loc, h_comp_total, offset_in_row;
+    uint4 s;
+
+    if (h_glob < NH) {
+        h_ptr = h_fwd_q; go_ptr = go_q; h_loc = h_glob; h_comp_total = NH;
+        offset_in_row = 0; s = sq;
+    } else if (h_glob < NH + NKVH) {
+        h_ptr = h_fwd_k; go_ptr = go_k; h_loc = h_glob - NH; h_comp_total = NKVH;
+        offset_in_row = NH * D; s = sk;
+    } else {
+        h_ptr = h_fwd_v; go_ptr = go_v; h_loc = h_glob - (NH + NKVH); h_comp_total = NKVH;
+        offset_in_row = (NH + NKVH) * D; s = sv;
+    }
+
+    Pointers p;
+    p.x = combined + (b * sc.x) + (last_t * sc.y) + (offset_in_row + h_loc * D + d) * sc.z;
+    p.l = combined + (b * sc.x) + (last_t * sc.y) + (offset_l + h_glob * Da + da_idx) * sc.z;
+    p.tr = go_ptr + (b * s.x + h_loc * s.y + last_t * s.z + d * s.w);
+    p.h_fwd_off = b * (h_comp_total * T * D) + h_loc * (T * D) + (last_t - 1) * D + d;
+    return p;
+}
+
+// Store a float into an atomic uint slot
+void atomic_store_float_tg(threadgroup atomic_uint* addr, float value) {
+    atomic_store_explicit(addr, as_type<uint>(value), memory_order_relaxed);
+}
+
+// Load a float from an atomic uint slot
+float atomic_load_float_tg(threadgroup atomic_uint* addr) {
+    return as_type<float>(atomic_load_explicit(addr, memory_order_relaxed));
+}
+
+// Atomic add for floats using a uint compare-exchange loop
+void atomic_add_float_tg(threadgroup atomic_uint* addr, float delta) {
+    uint expected_u = atomic_load_explicit(addr, memory_order_relaxed);
+    while (true) {
+        float expected_f = as_type<float>(expected_u);
+        float desired_f = expected_f + delta;
+        uint desired_u = as_type<uint>(desired_f);
+        if (atomic_compare_exchange_weak_explicit(addr, &expected_u, desired_u, memory_order_relaxed, memory_order_relaxed)) {
+            break;
+        }
+    }
+}
+
+// Internal implementation: Direct version (no smem, for r=1)
+inline void ltv_fused_concat_scan_backward_impl_direct(
+    device const float* combined,
+    device const float* bias,
+    device const float* inits,
+    device const float* h_fwd_q,
+    device const float* h_fwd_k,
+    device const float* h_fwd_v,
+    device const float* go_q,
+    device const float* go_k,
+    device const float* go_v,
+    device float* grad_comb,
+    device float* di,
+    constant uint3& sc, constant uint3& sgc,
+    constant uint4& sq, constant uint4& sk, constant uint4& sv,
+    uint B_size, uint T_size, uint NH_count, uint NKVH_count, uint Da_count, uint r_size,
+    uint3 id
+) {
+    const uint b = id.x; const uint h_glob = id.y; const uint d = id.z;
+    const uint D = Da_count * r_size;
+
+    Pointers p = get_ptrs(combined, h_fwd_q, h_fwd_k, h_fwd_v, go_q, go_k, go_v, sc, sq, sk, sv, b, h_glob, d, Da_count, r_size, T_size, NH_count, NKVH_count);
+    
+    const uint da_idx = d / r_size;
+    const uint total_h = NH_count + 2 * NKVH_count;
+    const uint offset_l = total_h * D;
+    const uint h_loc_mapped = (h_glob < NH_count) ? h_glob : (h_glob < NH_count + NKVH_count ? h_glob - NH_count : h_glob - (NH_count + NKVH_count));
+    const uint offset_in_row = (h_glob < NH_count) ? 0 : (h_glob < NH_count + NKVH_count ? NH_count * D : (NH_count + NKVH_count) * D);
+
+    uint g_x_idx = (b * sgc.x) + ((T_size-1) * sgc.y) + (offset_in_row + h_loc_mapped * D + d) * sgc.z;
+    uint g_l_idx = (b * sgc.x) + ((T_size-1) * sgc.y) + (offset_l + h_glob * Da_count + da_idx) * sgc.z;
+
+    const float b_val = bias[h_glob * Da_count + da_idx];
+    const uint h_comp_total = (h_glob < NH_count) ? NH_count : NKVH_count;
+    device const float* h_fwd_base = (h_glob < NH_count) ? h_fwd_q : (h_glob < NH_count + NKVH_count ? h_fwd_k : h_fwd_v);
+    
+    float gh_rec = 0.0f;
+
+    for (int t = (int)T_size - 1; t > 0; t--) {
+        const float alpha = 1.0f / (1.0f + exp(-(*p.l + b_val)));
+        const float gh_t = (*p.tr) + gh_rec;
+        
+        grad_comb[g_x_idx] = gh_t * alpha;
+        grad_comb[g_l_idx] = gh_t * (*p.x - h_fwd_base[p.h_fwd_off]) * (alpha * (1.0f - alpha));
+
+        gh_rec = gh_t * (1.0f - alpha);
+
+        p.x -= sc.y; p.l -= sc.y; p.tr -= (h_glob < NH_count ? sq.z : (h_glob < NH_count + NKVH_count ? sk.z : sv.z));
+        g_x_idx -= sgc.y; g_l_idx -= sgc.y; p.h_fwd_off -= D;
+    }
+    // t=0
+    const float alpha = 1.0f / (1.0f + exp(-(*p.l + b_val)));
+    const float gh_t = (*p.tr) + gh_rec;
+    grad_comb[g_x_idx] = gh_t * alpha;
+    const float init_v = inits[b * total_h * D + h_glob * D + d];
+    grad_comb[g_l_idx] = gh_t * (*p.x - init_v) * (alpha * (1.0f - alpha));
+
+    di[b * total_h * D + h_glob * D + d] = gh_t * (1.0f - alpha);
+}
+
+// Internal implementation: Atomic version (uses smem, for r > 1)
+inline void ltv_fused_concat_scan_backward_impl_atomic(
+    device const float* combined,
+    device const float* bias,
+    device const float* inits,
+    device const float* h_fwd_q,
+    device const float* h_fwd_k,
+    device const float* h_fwd_v,
+    device const float* go_q,
+    device const float* go_k,
+    device const float* go_v,
+    device float* grad_comb,
+    device float* di,
+    constant uint3& sc, constant uint3& sgc,
+    constant uint4& sq, constant uint4& sk, constant uint4& sv,
+    uint B_size, uint T_size, uint NH_count, uint NKVH_count, uint Da_count, uint r_size,
+    threadgroup atomic_uint* smem_g_l [[threadgroup(0)]],
+    uint3 id
+) {
+    const uint b = id.x; const uint h_glob = id.y; const uint d = id.z;
+    const uint D = Da_count * r_size;
+
+    Pointers p = get_ptrs(combined, h_fwd_q, h_fwd_k, h_fwd_v, go_q, go_k, go_v, sc, sq, sk, sv, b, h_glob, d, Da_count, r_size, T_size, NH_count, NKVH_count);
+    
+    const uint da_idx = d / r_size;
+    const uint total_h = NH_count + 2 * NKVH_count;
+    const uint offset_l = total_h * D;
+    const uint h_loc_mapped = (h_glob < NH_count) ? h_glob : (h_glob < NH_count + NKVH_count ? h_glob - NH_count : h_glob - (NH_count + NKVH_count));
+    const uint offset_in_row = (h_glob < NH_count) ? 0 : (h_glob < NH_count + NKVH_count ? NH_count * D : (NH_count + NKVH_count) * D);
+
+    uint g_x_idx = (b * sgc.x) + ((T_size-1) * sgc.y) + (offset_in_row + h_loc_mapped * D + d) * sgc.z;
+    uint g_l_idx = (b * sgc.x) + ((T_size-1) * sgc.y) + (offset_l + h_glob * Da_count + da_idx) * sgc.z;
+
+    const uint g_l_idx_leader = metal::simd_broadcast_first(g_l_idx);
+    const bool group_is_uniform = metal::simd_all(g_l_idx == g_l_idx_leader);
+
+    const float b_val = bias[h_glob * Da_count + da_idx];
+    const uint h_comp_total = (h_glob < NH_count) ? NH_count : NKVH_count;
+    device const float* h_fwd_base = (h_glob < NH_count) ? h_fwd_q : (h_glob < NH_count + NKVH_count ? h_fwd_k : h_fwd_v);
+    
+    if (d < Da_count) {
+        atomic_store_float_tg(&smem_g_l[d], 0.0f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float gh_rec = 0.0f;
+
+    for (int t = (int)T_size - 1; t > 0; t--) {
+        const float alpha = 1.0f / (1.0f + exp(-(*p.l + b_val)));
+        const float gh_t = (*p.tr) + gh_rec;
+        
+        grad_comb[g_x_idx] = gh_t * alpha;
+
+        const float d_logit = gh_t * (*p.x - h_fwd_base[p.h_fwd_off]) * (alpha * (1.0f - alpha));
+
+        if (group_is_uniform) {
+            float summed = simd_sum(d_logit);
+            if (simd_is_first()) {
+                atomic_add_float_tg(&smem_g_l[da_idx], summed);
+            }
+        } else {
+            atomic_add_float_tg(&smem_g_l[da_idx], d_logit);
+        }
+
+        gh_rec = gh_t * (1.0f - alpha);
+
+        p.x -= sc.y; p.l -= sc.y; p.tr -= (h_glob < NH_count ? sq.z : (h_glob < NH_count + NKVH_count ? sk.z : sv.z));
+        g_x_idx -= sgc.y; g_l_idx -= sgc.y; p.h_fwd_off -= D;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (d == da_idx * r_size) {
+            grad_comb[g_l_idx] = atomic_load_float_tg(&smem_g_l[da_idx]);
+            atomic_store_float_tg(&smem_g_l[da_idx], 0.0f);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // t=0
+    const float alpha = 1.0f / (1.0f + exp(-(*p.l + b_val)));
+    const float gh_t = (*p.tr) + gh_rec;
+    grad_comb[g_x_idx] = gh_t * alpha;
+    const float init_v = inits[b * total_h * D + h_glob * D + d];
+    const float d_logit = gh_t * (*p.x - init_v) * (alpha * (1.0f - alpha));
+
+    if (group_is_uniform) {
+        float summed = simd_sum(d_logit);
+        if (simd_is_first()) {
+            atomic_add_float_tg(&smem_g_l[da_idx], summed);
+        }
+    } else {
+        atomic_add_float_tg(&smem_g_l[da_idx], d_logit);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (d == da_idx * r_size) {
+        grad_comb[g_l_idx] = atomic_load_float_tg(&smem_g_l[da_idx]);
+    }
+
+    di[b * total_h * D + h_glob * D + d] = gh_t * (1.0f - alpha);
+}
+
+// Entry points for Rust context:
+// Direct variant (FAST path for r=1)
+kernel void ltv_fused_concat_scan_backward_direct(
+    device const float* combined     [[buffer(0)]],
+    device const float* bias         [[buffer(1)]],
+    device const float* inits        [[buffer(2)]],
+    device const float* h_fwd_q      [[buffer(3)]],
+    device const float* h_fwd_k      [[buffer(4)]],
+    device const float* h_fwd_v      [[buffer(5)]],
+    device const float* go_q         [[buffer(6)]],
+    device const float* go_k         [[buffer(7)]],
+    device const float* go_v         [[buffer(8)]],
+    device float* grad_comb          [[buffer(9)]],
+    device float* di                 [[buffer(10)]],
+    constant uint3& sc [[buffer(11)]], constant uint3& sgc [[buffer(12)]],
+    constant uint4& sq [[buffer(13)]], constant uint4& sk [[buffer(14)]], constant uint4& sv [[buffer(15)]],
+    constant uint& B [[buffer(16)]], constant uint& T [[buffer(17)]],
+    constant uint& NH [[buffer(18)]], constant uint& NKVH [[buffer(19)]],
+    constant uint& Da [[buffer(20)]], constant uint& r [[buffer(21)]],
+    uint3 id [[thread_position_in_grid]]
+) {
+    ltv_fused_concat_scan_backward_impl_direct(
+        combined, bias, inits, h_fwd_q, h_fwd_k, h_fwd_v, go_q, go_k, go_v, grad_comb, di,
+        sc, sgc, sq, sk, sv, B, T, NH, NKVH, Da, r, id
+    );
+}
+
+// Atomic variant (uses smem, for r > 1)
+kernel void ltv_fused_concat_scan_backward_atomic(
+    device const float* combined     [[buffer(0)]],
+    device const float* bias         [[buffer(1)]],
+    device const float* inits        [[buffer(2)]],
+    device const float* h_fwd_q      [[buffer(3)]],
+    device const float* h_fwd_k      [[buffer(4)]],
+    device const float* h_fwd_v      [[buffer(5)]],
+    device const float* go_q         [[buffer(6)]],
+    device const float* go_k         [[buffer(7)]],
+    device const float* go_v         [[buffer(8)]],
+    device float* grad_comb          [[buffer(9)]],
+    device float* di                 [[buffer(10)]],
+    constant uint3& sc [[buffer(11)]], constant uint3& sgc [[buffer(12)]],
+    constant uint4& sq [[buffer(13)]], constant uint4& sk [[buffer(14)]], constant uint4& sv [[buffer(15)]],
+    constant uint& B [[buffer(16)]], constant uint& T [[buffer(17)]],
+    constant uint& NH [[buffer(18)]], constant uint& NKVH [[buffer(19)]],
+    constant uint& Da [[buffer(20)]], constant uint& r [[buffer(21)]],
+    threadgroup atomic_uint* smem_g_l [[threadgroup(0)]],
+    uint3 id [[thread_position_in_grid]]
+) {
+    ltv_fused_concat_scan_backward_impl_atomic(
+        combined, bias, inits, h_fwd_q, h_fwd_k, h_fwd_v, go_q, go_k, go_v, grad_comb, di,
+        sc, sgc, sq, sk, sv, B, T, NH, NKVH, Da, r, smem_g_l, id
+    );
+}

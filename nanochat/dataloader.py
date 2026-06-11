@@ -1,4 +1,6 @@
 from collections import deque
+import time
+import logging
 
 import torch
 import pyarrow.parquet as pq
@@ -6,6 +8,8 @@ import pyarrow.parquet as pq
 from nanochat.common import get_dist_info
 from nanochat.dataset import list_parquet_files
 from nanochat.tokenizer import get_tokenizer
+
+logger = logging.getLogger(__name__)
 
 def tokenizing_distributed_data_loader_with_state(B, T, split, tokenizer_threads=4, tokenizer_batch_size=128, device="cuda", resume_state_dict=None):
     """
@@ -68,6 +72,7 @@ def tokenizing_distributed_data_loader_with_state(B, T, split, tokenizer_threads
     # scratch buffer holds the tokens for one iteration
     token_buffer = deque() # we stream tokens on the right and pop from the left
     while True:
+        # t_iteration_start = time.perf_counter()
         # Accumulate enough tokens for one iteration before yielding.
         while len(token_buffer) < needed_tokens:
             doc_batch, (pq_idx, rg_idx) = next(batches)
@@ -82,9 +87,17 @@ def tokenizing_distributed_data_loader_with_state(B, T, split, tokenizer_threads
         # Create the inputs/targets as 1D tensors
         inputs_cpu = scratch[:-1]
         targets_cpu = scratch[1:]
-        # Reshape to 2D and move to GPU async
-        inputs = inputs_cpu.view(B, T).to(device=device, non_blocking=use_cuda_optimizations)
-        targets = targets_cpu.view(B, T).to(device=device, non_blocking=use_cuda_optimizations)
+
+        # t0 = time.perf_counter()
+        # Copy to device
+        with torch.no_grad():
+            # Reshape to 2D and move to GPU async
+            inputs = inputs_cpu.view(B, T).to(device=device, non_blocking=use_cuda_optimizations)
+            targets = targets_cpu.view(B, T).to(device=device, non_blocking=use_cuda_optimizations)
+        # t1 = time.perf_counter()
+        # logger.info("copy %s, %s copy time: %.6f / %.6f", inputs_cpu.shape, targets_cpu.shape, t1 - t0, t1 - t_iteration_start)
+
+
         state_dict = {"pq_idx": pq_idx, "rg_idx": rg_idx} # we need this in case we wish to approximately resume training
         yield inputs, targets, state_dict
 

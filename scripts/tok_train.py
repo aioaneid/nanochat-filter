@@ -17,6 +17,7 @@ parser = argparse.ArgumentParser(description='Train a BPE tokenizer')
 parser.add_argument('--max_chars', type=int, default=10_000_000_000, help='Maximum characters to train on (default: 10B)')
 parser.add_argument('--doc_cap', type=int, default=10_000, help='Maximum characters per document (default: 10,000)')
 parser.add_argument('--vocab_size', type=int, default=65536, help='Vocabulary size (default: 65536 = 2^16)')
+parser.add_argument("--report_name", type=str, default="report")
 args = parser.parse_args()
 print(f"max_chars: {args.max_chars:,}")
 print(f"doc_cap: {args.doc_cap:,}")
@@ -93,7 +94,7 @@ print(f"Saved token_bytes to {token_bytes_path}")
 # Log to report
 from nanochat.report import get_report
 token_bytes_nonzero = (token_bytes[token_bytes > 0]).to(dtype=torch.float32)
-get_report().log(section="Tokenizer training", data=[
+get_report(args.report_name).log(section="Tokenizer training", data=[
     vars(args), # argparse command line arguments
     {"train_time": train_time},
     {"num_special_tokens": len(special_set)},

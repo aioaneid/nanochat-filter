@@ -5,21 +5,59 @@ python -m pytest tests/test_engine.py -v
 """
 
 import torch
-from nanochat.engine import KVCache, Engine
-from dataclasses import dataclass
+import pytest
+from nanochat.engine import Engine
+from nanochat.gpt_config import UNBOUNDED_LAYER_SPEC, ChunksAndHistory
+from nanochat.kv_cache import KVCache
+from nanochat.ltv.ltv_mode import LtvMode
+from dataclasses import dataclass, field
 
 
 # -----------------------------------------------------------------------------
 # Mock classes for testing Engine without loading a real model
 
+# Parameterized test configurations for MockModel
+LTV_CONFIGURATIONS = [
+    # ltv_r=0 case
+    (0, LtvMode.NONE, LtvMode.NONE, LtvMode.NONE),
+    # ltv_r=1 with all 8 combinations of NONE/ACTIVE
+    (1, LtvMode.NONE, LtvMode.NONE, LtvMode.NONE),
+    (1, LtvMode.NONE, LtvMode.NONE, LtvMode.ACTIVE),
+    (1, LtvMode.NONE, LtvMode.ACTIVE, LtvMode.NONE),
+    (1, LtvMode.NONE, LtvMode.ACTIVE, LtvMode.ACTIVE),
+    (1, LtvMode.ACTIVE, LtvMode.NONE, LtvMode.NONE),
+    (1, LtvMode.ACTIVE, LtvMode.NONE, LtvMode.ACTIVE),
+    (1, LtvMode.ACTIVE, LtvMode.ACTIVE, LtvMode.NONE),
+    (1, LtvMode.ACTIVE, LtvMode.ACTIVE, LtvMode.ACTIVE),
+]
+
+
 @dataclass
 class MockConfig:
     """Minimal config for Engine tests."""
+
     n_kv_head: int = 4
     n_head: int = 4
     n_embd: int = 64
     n_layer: int = 2
     sequence_len: int = 128
+    layer_specs: list[ChunksAndHistory] = field(
+        default_factory=lambda: [UNBOUNDED_LAYER_SPEC] * 2
+    )
+
+    ltv_r: int = 0
+    ltv_query: LtvMode = LtvMode.NONE
+    ltv_key: LtvMode = LtvMode.NONE
+    ltv_value: LtvMode = LtvMode.NONE
+
+    def __post_init__(self):
+        if not self.ltv_r:
+            assert self.ltv_query == LtvMode.NONE
+            assert self.ltv_key == LtvMode.NONE
+            assert self.ltv_value == LtvMode.NONE
+
+    def num_ltv_layers(self):
+        return len(self.layer_specs)
 
 
 class MockModel:
@@ -28,9 +66,22 @@ class MockModel:
     This ensures that with temperature > 0, different samples should
     (with very high probability) produce different tokens.
     """
-    def __init__(self, vocab_size=262):  # 256 bytes + 6 special tokens
+
+    def __init__(
+        self,
+        vocab_size=262,
+        ltv_r: int = 0,
+        ltv_query: LtvMode = LtvMode.NONE,
+        ltv_key: LtvMode = LtvMode.NONE,
+        ltv_value: LtvMode = LtvMode.NONE,
+    ):  # 256 bytes + 6 special tokens
         self.vocab_size = vocab_size
-        self.config = MockConfig()
+        self.config = MockConfig(
+            ltv_r=ltv_r,
+            ltv_query=ltv_query,
+            ltv_key=ltv_key,
+            ltv_value=ltv_value,
+        )
         self._device = "cpu"
 
     def get_device(self):
@@ -45,7 +96,21 @@ class MockModel:
             for layer_idx in range(self.config.n_layer):
                 k = torch.zeros(B, self.config.n_kv_head, T, head_dim)
                 v = torch.zeros(B, self.config.n_kv_head, T, head_dim)
+                if self.config.ltv_r:
+                    kv_cache.update_last_qkv(
+                        layer_idx,
+                        q=torch.zeros(B, self.config.n_head, head_dim)
+                        if self.config.ltv_query == LtvMode.ACTIVE
+                        else None,
+                        k=k[:, :, -1, :]
+                        if self.config.ltv_key == LtvMode.ACTIVE
+                        else None,
+                        v=v[:, :, -1, :]
+                        if self.config.ltv_value == LtvMode.ACTIVE
+                        else None,
+                    )
                 kv_cache.insert_kv(layer_idx, k, v)
+
         # Uniform logits -> equal probability for all tokens
         logits = torch.zeros(B, T, self.vocab_size)
         return logits
@@ -56,6 +121,7 @@ class ByteTokenizer:
     Simple byte-level tokenizer for testing.
     Tokens 0-255 are raw bytes, 256+ are special tokens.
     """
+
     def __init__(self):
         # Special tokens start at 256
         self._special_tokens = {
@@ -85,6 +151,10 @@ class ByteTokenizer:
         byte_tokens = [t for t in tokens if t < 256]
         return bytes(byte_tokens).decode("utf-8", errors="replace")
 
+
+# TODO: Parameterize with only 1 layer
+
+
 def test_kv_cache_resize():
     """
     The KV cache was not resized correctly, more information here:
@@ -100,17 +170,27 @@ def test_kv_cache_resize():
 
     kv_cache = KVCache(
         batch_size=batch_size,
-        num_heads=num_heads,
+        num_q_heads=num_heads,
+        num_kv_heads=num_heads,
         seq_len=seq_len,
         head_dim=head_dim,
-        num_layers=num_layers
+        num_layers=num_layers,
+        layer_specs=[UNBOUNDED_LAYER_SPEC] * num_layers,
     )
 
     # Insert a single token with a distinct fill value to all layers
     def insert_token(token_idx):
         for layer_idx in range(num_layers):
-            k = torch.full((batch_size, num_heads, 1, head_dim), fill_value=float(token_idx), dtype=torch.float32)
-            v = torch.full((batch_size, num_heads, 1, head_dim), fill_value=float(token_idx * 100), dtype=torch.float32)
+            k = torch.full(
+                (batch_size, num_heads, 1, head_dim),
+                fill_value=float(token_idx),
+                dtype=torch.float32,
+            )
+            v = torch.full(
+                (batch_size, num_heads, 1, head_dim),
+                fill_value=float(token_idx * 100),
+                dtype=torch.float32,
+            )
             kv_cache.insert_kv(layer_idx, k, v)
 
     # Insert 4 tokens (fills the initial seq_len=4)
@@ -125,7 +205,9 @@ def test_kv_cache_resize():
     insert_token(4)
     # Verify that the cache actually resized
     new_seq_len = kv_cache.kv_cache.shape[4]
-    assert new_seq_len > original_seq_len, f"Cache did not resize: original seq_len={original_seq_len}, new seq_len={new_seq_len}"
+    assert new_seq_len > original_seq_len, (
+        f"Cache did not resize: original seq_len={original_seq_len}, new seq_len={new_seq_len}"
+    )
 
     # Verify that the original 4 tokens are still intact after resize
     for layer_idx in range(num_layers):
@@ -135,16 +217,25 @@ def test_kv_cache_resize():
             expected_v = float(token_idx * 100)
             actual_k = kv_cache.kv_cache[layer_idx, 0, :, :, token_idx, :]
             actual_v = kv_cache.kv_cache[layer_idx, 1, :, :, token_idx, :]
-            assert (actual_k == expected_k).all(), f"Layer {layer_idx}, token {token_idx}: key corrupted, expected {expected_k}"
-            assert (actual_v == expected_v).all(), f"Layer {layer_idx}, token {token_idx}: value corrupted, expected {expected_v}"
+            assert (actual_k == expected_k).all(), (
+                f"Layer {layer_idx}, token {token_idx}: key corrupted, expected {expected_k}"
+            )
+            assert (actual_v == expected_v).all(), (
+                f"Layer {layer_idx}, token {token_idx}: value corrupted, expected {expected_v}"
+            )
             # And that the original cache matches resized cache
             original_k = original_cache[layer_idx, 0, :, :, token_idx, :]
             original_v = original_cache[layer_idx, 1, :, :, token_idx, :]
-            assert (actual_k == original_k).all(), f"Layer {layer_idx}, token {token_idx}: key doesn't match original"
-            assert (actual_v == original_v).all(), f"Layer {layer_idx}, token {token_idx}: value doesn't match original"
+            assert (actual_k == original_k).all(), (
+                f"Layer {layer_idx}, token {token_idx}: key doesn't match original"
+            )
+            assert (actual_v == original_v).all(), (
+                f"Layer {layer_idx}, token {token_idx}: value doesn't match original"
+            )
 
 
-def test_multi_sample_first_token_diversity():
+@pytest.mark.parametrize("ltv_r,ltv_query,ltv_key,ltv_value", LTV_CONFIGURATIONS)
+def test_multi_sample_first_token_diversity(ltv_r, ltv_query, ltv_key, ltv_value):
     """
     Test that when generating multiple samples, each sample gets an independently
     sampled first token (not a broadcast of the same token to all rows).
@@ -157,7 +248,18 @@ def test_multi_sample_first_token_diversity():
     samples independently pick the same token is (1/262)^15 ≈ 10^-36. So if they're
     all identical, it indicates tokens are being broadcast instead of independently sampled.
     """
-    model = MockModel(vocab_size=262)
+    model = MockModel(
+        vocab_size=262,
+        ltv_r=ltv_r,
+        ltv_query=ltv_query,
+        ltv_key=ltv_key,
+        ltv_value=ltv_value,
+    )
+    # Update model config to match LTV settings
+    model.config.ltv_r = ltv_r
+    model.config.ltv_query = ltv_query
+    model.config.ltv_key = ltv_key
+    model.config.ltv_value = ltv_value
     tokenizer = ByteTokenizer()
     engine = Engine(model, tokenizer)
 
@@ -184,4 +286,127 @@ def test_multi_sample_first_token_diversity():
         f"All {num_samples} samples got the same first token ({first_tokens[0]}). "
         f"With uniform logits, this is statistically impossible (~10^-36 probability) "
         f"unless tokens are being broadcast instead of independently sampled."
+    )
+
+
+@pytest.mark.parametrize("ltv_r,ltv_query,ltv_key,ltv_value", LTV_CONFIGURATIONS)
+def test_seed_reproducibility(ltv_r, ltv_query, ltv_key, ltv_value):
+    """Same seed must produce identical output."""
+    model = MockModel(
+        ltv_r=ltv_r, ltv_query=ltv_query, ltv_key=ltv_key, ltv_value=ltv_value
+    )
+    # Update model config to match LTV settings
+    model.config.ltv_r = ltv_r
+    model.config.ltv_query = ltv_query
+    model.config.ltv_key = ltv_key
+    model.config.ltv_value = ltv_value
+    engine = Engine(model, ByteTokenizer())
+    prompt = [261, 72, 101, 108, 108, 111]  # <bos> + "Hello"
+
+    for seed in [1, 42, 123, 999]:
+        r1, _ = engine.generate_batch(prompt, max_tokens=5, seed=seed)
+        r2, _ = engine.generate_batch(prompt, max_tokens=5, seed=seed)
+        r3, _ = engine.generate_batch(prompt, max_tokens=5, seed=seed)
+        assert r1 == r2 == r3, (
+            "Same seed must produce identical output for the same prompt."
+        )
+
+
+@pytest.mark.parametrize("ltv_r,ltv_query,ltv_key,ltv_value", LTV_CONFIGURATIONS)
+def test_temperature_zero_determinism(ltv_r, ltv_query, ltv_key, ltv_value):
+    """Temperature=0 is deterministic regardless of seed."""
+    model = MockModel(
+        ltv_r=ltv_r, ltv_query=ltv_query, ltv_key=ltv_key, ltv_value=ltv_value
+    )
+    # Update model config to match LTV settings
+    model.config.ltv_r = ltv_r
+    model.config.ltv_query = ltv_query
+    model.config.ltv_key = ltv_key
+    model.config.ltv_value = ltv_value
+    engine = Engine(model, ByteTokenizer())
+    prompt = [261, 72, 101, 108, 108, 111]
+
+    r1, _ = engine.generate_batch(prompt, temperature=0.0, max_tokens=5, seed=1)
+    r2, _ = engine.generate_batch(prompt, temperature=0.0, max_tokens=5, seed=42)
+    r3, _ = engine.generate_batch(prompt, temperature=0.0, max_tokens=5, seed=123)
+    assert r1 == r2 == r3, (
+        "Temperature=0 must result in the same output for the same prompt regardless of seed."
+    )
+
+
+@pytest.mark.parametrize("ltv_r,ltv_query,ltv_key,ltv_value", LTV_CONFIGURATIONS)
+def test_max_tokens_respected(ltv_r, ltv_query, ltv_key, ltv_value):
+    """Generation stops at max_tokens limit."""
+    model = MockModel(
+        ltv_r=ltv_r, ltv_query=ltv_query, ltv_key=ltv_key, ltv_value=ltv_value
+    )
+    # Update model config to match LTV settings
+    model.config.ltv_r = ltv_r
+    model.config.ltv_query = ltv_query
+    model.config.ltv_key = ltv_key
+    model.config.ltv_value = ltv_value
+    engine = Engine(model, ByteTokenizer())
+    prompt = [261, 72, 101, 108, 108, 111]
+
+    for max_tokens in [1, 4, 16, 64]:
+        results, _ = engine.generate_batch(prompt, max_tokens=max_tokens)
+        num_generated_tokens = len(results[0]) - len(prompt)
+        assert num_generated_tokens <= max_tokens, (
+            f"Generated {num_generated_tokens} tokens, expected max_tokens={max_tokens} or less."
+        )
+
+
+@pytest.mark.parametrize("ltv_r,ltv_query,ltv_key,ltv_value", LTV_CONFIGURATIONS)
+def test_num_samples_count(ltv_r, ltv_query, ltv_key, ltv_value):
+    """num_samples=N produces exactly N sequences."""
+    model = MockModel(
+        ltv_r=ltv_r, ltv_query=ltv_query, ltv_key=ltv_key, ltv_value=ltv_value
+    )
+    # Update model config to match LTV settings
+    model.config.ltv_r = ltv_r
+    model.config.ltv_query = ltv_query
+    model.config.ltv_key = ltv_key
+    model.config.ltv_value = ltv_value
+    engine = Engine(model, ByteTokenizer())
+    prompt = [261, 72, 101, 108, 108, 111]
+
+    for num_samples in [1, 4, 16, 64]:
+        results, _ = engine.generate_batch(
+            prompt, num_samples=num_samples, max_tokens=3
+        )
+        assert len(results) == num_samples, (
+            f"Expected {num_samples} sequences from {num_samples} samples, got {len(results)}"
+        )
+
+
+@pytest.mark.parametrize("ltv_r,ltv_query,ltv_key,ltv_value", LTV_CONFIGURATIONS)
+def test_different_seeds_introduce_variation_when_temperature_nonzero(
+    ltv_r, ltv_query, ltv_key, ltv_value
+):
+    """With temperature > 0, different seeds should introduce sampling variation."""
+    model = MockModel(
+        ltv_r=ltv_r, ltv_query=ltv_query, ltv_key=ltv_key, ltv_value=ltv_value
+    )
+    # Update model config to match LTV settings
+    model.config.ltv_r = ltv_r
+    model.config.ltv_query = ltv_query
+    model.config.ltv_key = ltv_key
+    model.config.ltv_value = ltv_value
+    engine = Engine(model, ByteTokenizer())
+    prompt = [261, 72, 101, 108, 108, 111]  # <bos> + "Hello"
+
+    outputs = set()
+
+    for seed in [1, 42, 123, 999, 1000, 1001, 1002, 1003, 1004, 1005]:
+        results, _ = engine.generate_batch(
+            prompt,
+            temperature=1.0,
+            max_tokens=5,
+            seed=seed,
+        )
+        outputs.add(tuple(results[0]))
+
+    # Sanity check: sampling actually introduces variation
+    assert len(outputs) > 1, (
+        "All seeds produced the same output which is statistically highly improbable."
     )

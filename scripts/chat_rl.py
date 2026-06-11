@@ -20,21 +20,31 @@ import argparse
 import os
 import itertools
 import re
+from enum_actions import enum_action
 import wandb
 import torch
 import torch.distributed as dist
 from contextlib import nullcontext
+from distutils.util import strtobool
 
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type
 from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.engine import Engine
+try:
+    import rust_ewma
+except ImportError:
+    rust_ewma = None
+from nanochat.gpt_factory import ModelType, one_time_model_factory
+from nanochat.utils.tensorboard_adapter import TensorboardAdapter
 from tasks.gsm8k import GSM8K
+
+LOG_FACTOR = 1
 
 # -----------------------------------------------------------------------------
 # CLI arguments
 parser = argparse.ArgumentParser(description="Reinforcement learning on GSM8K")
 # Logging
-parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+parser.add_argument("--run", type=str, default="tensorboard", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
 parser.add_argument("--device_type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 parser.add_argument("--dtype", type=str, default="bfloat16", help="float32|bfloat16")
@@ -58,10 +68,16 @@ parser.add_argument("--unembedding_lr", type=float, default=0.004, help="learnin
 parser.add_argument("--matrix_lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay for embedding/unembedding parameters (Adam)")
 parser.add_argument("--init_lr_frac", type=float, default=0.05, help="initial LR as fraction of base LR")
+parser.add_argument("--combined_optimizers", type=lambda v: bool(strtobool(v)), default=False)
 # Evaluation / checkpointing
 parser.add_argument("--eval_every", type=int, default=60, help="evaluate pass@k every N steps")
 parser.add_argument("--eval_examples", type=int, default=400, help="number of examples for pass@k evaluation")
 parser.add_argument("--save_every", type=int, default=60, help="save checkpoint every N steps")
+parser.add_argument('--model_type', action=enum_action(ModelType), default=ModelType.ORIGINAL)
+parser.add_argument('--ltv_query', action=enum_action(LtvSplitMode), default=LtvSplitMode.NONE)
+parser.add_argument('--ltv_key', action=enum_action(LtvSplitMode), default=LtvSplitMode.NONE)
+parser.add_argument('--ltv_value', action=enum_action(LtvSplitMode), default=LtvSplitMode.NONE)
+parser.add_argument("--report_name", type=str, default="report")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -71,14 +87,23 @@ device_type = autodetect_device_type() if args.device_type == "" else args.devic
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 ptdtype = torch.float32 if args.dtype == 'float32' else torch.bfloat16
-autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
+autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type in ["cuda", "mps"] else nullcontext()
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-rl", name=args.run, config=user_config)
+wandb_run = DummyWandb() if use_dummy_wandb else TensorboardAdapter(project="nanochat-rl", name=args.run, config=user_config) if args.run.startswith("tensorboard") else wandb.init(project="nanochat-rl", name=args.run, config=user_config)
 
 # Init model and tokenizer
-model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.model_step)
+model, tokenizer, meta = load_model(
+    one_time_model_factory(
+        args.model_type, args.ltv_query, args.ltv_key, args.ltv_value
+    ),
+    args.source,
+    device,
+    phase="eval",
+    model_tag=args.model_tag,
+    step=args.model_step,
+)
 engine = Engine(model, tokenizer) # for sampling rollouts
 
 # -----------------------------------------------------------------------------
@@ -201,19 +226,32 @@ def run_gsm8k_eval(task, tokenizer, engine,
 # -----------------------------------------------------------------------------
 # Training loop
 
-# Init the optimizer
-optimizers = model.setup_optimizers(
-    unembedding_lr=args.unembedding_lr,
-    embedding_lr=args.embedding_lr,
-    matrix_lr=args.matrix_lr,
-    weight_decay=args.weight_decay,
-)
+if args.combined_optimizers:
+    optimizer = model.setup_optimizer(
+        unembedding_lr=args.unembedding_lr,
+        embedding_lr=args.embedding_lr,
+        matrix_lr=args.matrix_lr,
+        weight_decay=args.weight_decay,
+    )
+else:
+    # Init the optimizer
+    optimizers = model.setup_optimizers(
+        unembedding_lr=args.unembedding_lr,
+        embedding_lr=args.embedding_lr,
+        matrix_lr=args.matrix_lr,
+        weight_decay=args.weight_decay,
+    )
 
 # Set the initial learning rate as a fraction of the base learning rate
-for opt in optimizers:
-    for group in opt.param_groups:
+if args.combined_optimizers:
+    for group in optimizer.param_groups:
         group["lr"] = group["lr"] * args.init_lr_frac
-        group["initial_lr"] = group["lr"] # save the initial learning so we can decay easily later
+        group["initial_lr"] = group["lr"]
+else:
+    for opt in optimizers:
+        for group in opt.param_groups:
+            group["lr"] = group["lr"] * args.init_lr_frac
+            group["initial_lr"] = group["lr"] # save the initial learning so we can decay easily later
 
 # Learning rate scheduler: simple rampdown to zero over num_steps
 def get_lr_multiplier(it):
@@ -231,7 +269,7 @@ batch_iterator = get_batch()
 for step in range(num_steps):
 
     # Evaluate the model once in a while and log to wandb
-    if step % args.eval_every == 0:
+    if step % max(1, args.eval_every // LOG_FACTOR) == 0:
         model.eval()
         passk = torch.zeros(args.device_batch_size, device=device) # pass@k for k=1..device_batch_size
         with autocast_ctx:
@@ -306,11 +344,16 @@ for step in range(num_steps):
 
     # Update the model parameters
     lrm = get_lr_multiplier(step)
-    for opt in optimizers: # first set the learning rate
-        for group in opt.param_groups:
+    if args.combined_optimizers:
+        for group in optimizer.param_groups:
             group["lr"] = group["initial_lr"] * lrm
-    for opt in optimizers: # then step the optimizers
-        opt.step()
+        optimizer.step()
+    else:
+        for opt in optimizers: # first set the learning rate
+            for group in opt.param_groups:
+                group["lr"] = group["initial_lr"] * lrm
+        for opt in optimizers: # then step the optimizers
+            opt.step()
     model.zero_grad(set_to_none=True)
     wandb_run.log({
         "step": step,
@@ -318,7 +361,7 @@ for step in range(num_steps):
     })
 
     # Master process saves the model once in a while. Skip first step. Save last step.
-    if master_process and ((step > 0 and step % args.save_every == 0) or step == num_steps - 1):
+    if master_process and ((step > 0 and step % max(1, args.save_every // LOG_FACTOR) == 0) or step == num_steps - 1):
         base_dir = get_base_dir()
         depth = model.config.n_layer
         output_dirname = args.model_tag if args.model_tag else f"d{depth}" # base the model tag on the depth of the base model
@@ -337,7 +380,7 @@ for step in range(num_steps):
 
 # Log to report
 from nanochat.report import get_report
-get_report().log(section="Chat RL", data=[
+get_report(args.report_name).log(section="Chat RL", data=[
     user_config, # CLI args
 ])
 

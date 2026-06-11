@@ -2,6 +2,7 @@
 Evaluate compression ratio of the tokenizer.
 """
 
+import argparse
 from nanochat.tokenizer import get_tokenizer, RustBPETokenizer
 from nanochat.dataset import parquets_iter_batched
 
@@ -238,6 +239,10 @@ def print_comparison(baseline_name, baseline_results, ours_results, all_text):
               f"{diff_color}{relative_diff:+7.1f}%{RESET}     "
               f"{better:<10}")
 
+parser = argparse.ArgumentParser(description='Evaluate the BPE tokenizer')
+parser.add_argument("--report_name", type=str, default="report")
+args = parser.parse_args()
+
 # Print comparisons
 print_comparison("GPT-2", tokenizer_results['gpt2'], tokenizer_results['ours'], all_text)
 print_comparison("GPT-4", tokenizer_results['gpt4'], tokenizer_results['ours'], all_text)
@@ -260,6 +265,6 @@ for baseline_name in ["GPT-2", "GPT-4"]:
         lines.append(f"| {name} | {baseline_data['bytes']} | {baseline_data['tokens']} | {baseline_data['ratio']:.2f} | {ours_data['tokens']} | {ours_data['ratio']:.2f} | {relative_diff:+.1f}% |")
     lines.append("")
 report_markdown = "\n".join(lines)
-get_report().log(section="Tokenizer evaluation", data=[
+get_report(args.report_name).log(section="Tokenizer evaluation", data=[
     report_markdown,
 ])

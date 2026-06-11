@@ -1,0 +1,62 @@
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void ltv_fused_linear_scan_forward(
+    device const float* x_q         [[buffer(0)]],
+    device const float* x_k         [[buffer(1)]],
+    device const float* x_v         [[buffer(2)]],
+    device const float* x_gate      [[buffer(3)]], // Input to the alpha_mlp (B, T, n_embd)
+    device const float* w_gate      [[buffer(4)]], // (total_h * Da, n_embd)
+    device const float* b_gate      [[buffer(5)]], // (total_h * Da)
+    device const float* inits       [[buffer(6)]],
+    device float* out_q             [[buffer(7)]], 
+    device float* out_k             [[buffer(8)]], 
+    device float* out_v             [[buffer(9)]], 
+    constant uint& B                [[buffer(10)]],
+    constant uint& T                [[buffer(11)]],
+    constant uint& NH               [[buffer(12)]],
+    constant uint& NKVH             [[buffer(13)]],
+    constant uint& Da               [[buffer(14)]], // Groups
+    constant uint& r                [[buffer(15)]], // Expansion
+    constant uint& n_embd           [[buffer(16)]],
+    uint3 id [[thread_position_in_grid]]
+) {
+    uint b = id.x; uint h_glob = id.y; uint d = id.z;
+    uint D = Da * r;
+    uint total_h = NH + 2 * NKVH;
+    
+    device const float* x_in;
+    device float* x_out;
+    uint h_loc; uint h_comp_total;
+
+    if (h_glob < NH) { 
+        x_in = x_q; x_out = out_q; h_loc = h_glob; h_comp_total = NH; 
+    } else if (h_glob < NH + NKVH) { 
+        x_in = x_k; x_out = out_k; h_loc = h_glob - NH; h_comp_total = NKVH; 
+    } else { 
+        x_in = x_v; x_out = out_v; h_loc = h_glob - (NH + NKVH); h_comp_total = NKVH; 
+    }
+
+    float acc = inits[b * (total_h * D) + h_glob * D + d];
+    uint da_idx = d / r; 
+    uint alpha_idx = h_glob * Da + da_idx;
+
+    for (uint t = 0; t < T; t++) {
+        // --- FUSED LINEAR PROJECTION ---
+        float logit = b_gate[alpha_idx];
+        uint x_base = b * (T * n_embd) + t * n_embd;
+        uint w_base = alpha_idx * n_embd;
+        
+        for (uint k = 0; k < n_embd; k++) {
+            logit += x_gate[x_base + k] * w_gate[w_base + k];
+        }
+        
+        float alpha = 1.0f / (1.0f + exp(-logit));
+        
+        // --- EMA UPDATE ---
+        uint in_idx = b * (T * h_comp_total * D) + t * (h_comp_total * D) + h_loc * D + d;
+        acc = (1.0f - alpha) * acc + alpha * x_in[in_idx];
+        
+        x_out[b * (h_comp_total * T * D) + h_loc * (T * D) + t * D + d] = acc;
+    }
+}

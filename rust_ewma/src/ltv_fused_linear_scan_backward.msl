@@ -1,0 +1,126 @@
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void ltv_fused_linear_scan_backward(
+    device const float* x_q          [[buffer(0)]],
+    device const float* x_k          [[buffer(1)]],
+    device const float* x_v          [[buffer(2)]],
+    // l_{t} = \sum (x\_gate_{t, k} \cdot w\_gate_{k}) + b\_gate
+    device const float* x_gate      [[buffer(3)]],
+    // w\_gate gradients are accumulated via atomic_fetch_add
+    device const float* w_gate      [[buffer(4)]],
+    // b\_gate gradients are accumulated via atomic_fetch_add
+    device const float* b_gate      [[buffer(5)]],
+    device const float* i           [[buffer(6)]],
+    device const float* h_fwd_q     [[buffer(7)]],
+    device const float* h_fwd_k     [[buffer(8)]],
+    device const float* h_fwd_v     [[buffer(9)]],
+    device const float* go_q        [[buffer(10)]],
+    device const float* go_k        [[buffer(11)]],
+    device const float* go_v        [[buffer(12)]],
+    device float* dx_q              [[buffer(13)]],
+    device float* dx_k              [[buffer(14)]],
+    device float* dx_v              [[buffer(15)]],
+    // \frac{\partial L}{\partial x\_gate} = \sum (d\_logit \cdot w\_gate)
+    device atomic_float* dx_gate    [[buffer(16)]],
+    // \frac{\partial L}{\partial w\_gate} = \sum (d\_logit \cdot x\_gate)
+    device atomic_float* dw_gate    [[buffer(17)]],
+    // \frac{\partial L}{\partial b\_gate} = \sum (d\_logit)
+    device atomic_float* db_gate    [[buffer(18)]],
+    device float* di                [[buffer(19)]],
+    constant uint4& sq               [[buffer(20)]], // (sB, sT, sH, sD) from grad_out_q
+    constant uint4& sk               [[buffer(21)]], // (sB, sT, sH, sD) from grad_out_k
+    constant uint4& sv               [[buffer(22)]], // (sB, sT, sH, sD) from grad_out_v
+    constant uint& B                [[buffer(23)]],
+    constant uint& T                [[buffer(24)]],
+    constant uint& NH               [[buffer(25)]],
+    constant uint& NKVH              [[buffer(26)]],
+    constant uint& Da                [[buffer(27)]], 
+    constant uint& r                 [[buffer(28)]],
+    uint3 id [[thread_position_in_grid]]
+) {
+    uint b = id.x; 
+    uint h_glob = id.y; 
+    uint d = id.z;
+    
+    uint D = Da * r;
+    uint total_h = NH + 2 * NKVH;
+
+    // if (b >= B || h_glob >= total_h || d >= D) return;
+
+    // Direct buffer steering
+    device const float *x_ptr, *h_ptr, *go_ptr;
+    device float *dx_ptr;
+    uint h_loc, h_comp_total;
+    uint4 s; // Active stride
+
+    if (h_glob < NH) {
+        x_ptr = x_q; h_ptr = h_fwd_q; go_ptr = go_q; dx_ptr = dx_q; h_loc = h_glob; h_comp_total = NH;
+        s = sq;
+    } else if (h_glob < NH + NKVH) {
+        x_ptr = x_k; h_ptr = h_fwd_k; go_ptr = go_k; dx_ptr = dx_k; h_loc = h_glob - NH; h_comp_total = NKVH;
+        s = sk;
+    } else {
+        x_ptr = x_v; h_ptr = h_fwd_v; go_ptr = go_v; dx_ptr = dx_v; h_loc = h_glob - (NH + NKVH); h_comp_total = NKVH;
+        s = sv;
+    }
+
+    uint da_idx = d / r; 
+    float gh_recursive = 0.0f;
+
+    // constant
+    uint n_embd = NH * Da * r;
+
+    // Simple sequential scan backward through time
+    for (int t = (int)T - 1; t >= 0; t--) {
+        // Indexing logic
+        uint alpha_idx = h_glob * Da + da_idx;
+        // Updated in_idx for Time-Major (B, T, H, D)
+        uint in_idx = b * (T * h_comp_total * D) + t * (h_comp_total * D) + h_loc * D + d;
+        // uint in_idx = b * (h_comp_total * T * D) + h_loc * (T * D) + t * D + d;
+
+        // DYNAMIC STRIDE INDEXING
+        uint tr_idx = b * s.x + h_loc * s.y + t * s.z + d * s.w;
+
+        // logit = b\_gate[alpha\_idx] + \sum_{k=0}^{n\_embd} (x\_gate_{b,t,k} \cdot w\_gate_{alpha\_idx, k})
+        float logit = b_gate[alpha_idx];
+        // xg\_base = (b \cdot T \cdot n\_embd) + (t \cdot n\_embd)
+        uint xg_base = b * (T * n_embd) + t * n_embd;
+        // w\_base = alpha\_idx \cdot n\_embd
+        uint w_base  = alpha_idx * n_embd;
+        // Dot product implementation of linear layer
+        for (uint k = 0; k < n_embd; ++k) {
+            logit += x_gate[xg_base + k] * w_gate[w_base + k];
+        }
+
+        float alpha = 1.0f / (1.0f + exp(-logit));
+        float gh_t = go_ptr[tr_idx] + gh_recursive;
+
+        // Gradient w.r.t input x
+        dx_ptr[in_idx] = gh_t * alpha;
+
+        // Gradient w.r.t logit (l)
+        // h\_ptr is Head-Major from Forward: (B, H, T, D)
+        float h_prev = (t == 0) ? i[b * total_h * D + h_glob * D + d] 
+                                : h_ptr[b * (h_comp_total * T * D) + h_loc * (T * D) + (t - 1) * D + d];
+        
+        float d_alpha = gh_t * (x_ptr[in_idx] - h_prev);
+        float d_logit = d_alpha * (alpha * (1.0f - alpha));
+        
+        // Gate parameter and input gradient accumulation
+        // \frac{\partial L}{\partial b\_gate} = d\_logit
+        atomic_fetch_add_explicit(&db_gate[alpha_idx], d_logit, memory_order_relaxed);
+        // Loop for \frac{\partial L}{\partial w\_gate} and \frac{\partial L}{\partial x\_gate}
+        for (uint k = 0; k < n_embd; ++k) {
+            // \frac{\partial L}{\partial w\_gate_{k}} = d\_logit \cdot x\_gate_{k}
+            atomic_fetch_add_explicit(&dw_gate[w_base + k], d_logit * x_gate[xg_base + k], memory_order_relaxed);
+            // \frac{\partial L}{\partial x\_gate_{k}} = d\_logit \cdot w\_gate_{k}
+            atomic_fetch_add_explicit(&dx_gate[xg_base + k], d_logit * w_gate[w_base + k], memory_order_relaxed);
+        }
+
+        gh_recursive = gh_t * (1.0f - alpha);
+    }
+    
+    // Save gradient for the initial state
+    di[b * total_h * D + h_glob * D + d] = gh_recursive;
+}

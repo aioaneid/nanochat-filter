@@ -5,11 +5,13 @@ https://arxiv.org/abs/2406.11794
 TODOs:
 - All tasks ~match except for squad. We get 31% reference is 37%. Figure out why.
 """
+import pathlib
 import random
 
 from jinja2 import Template
 import torch
 import torch.distributed as dist
+from nanochat.train_utils import sleep_if_paused
 
 # -----------------------------------------------------------------------------
 # Prompt rendering utilities
@@ -249,8 +251,10 @@ def evaluate_task(model, tokenizer, data, device, task_meta):
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     correct = torch.zeros(len(data), dtype=torch.float32, device=device)
+    pause_file = pathlib.Path("/tmp/evaluate_task.pause")
     # stride the examples to each rank
     for idx in range(rank, len(data), world_size):
+        sleep_if_paused(pause_file)
         is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta)
         correct[idx] = float(is_correct)
     # sync results across all the processes if running distributed

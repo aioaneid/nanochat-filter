@@ -1,0 +1,80 @@
+// --- REGISTER-CAST ATOMIC BACKWARD (optimized with threadgroup memory) ---
+kernel void ltv_fused_concat_register_cast_scan_backward_atomic(
+    device const bfloat* combined    [[buffer(0)]],
+    device const bfloat* inits       [[buffer(1)]],
+    device const bfloat* h_fwd_q     [[buffer(2)]],
+    device const bfloat* h_fwd_k     [[buffer(3)]],
+    device const bfloat* h_fwd_v     [[buffer(4)]],
+    device const bfloat* go_q        [[buffer(5)]],
+    device const bfloat* go_k        [[buffer(6)]],
+    device const bfloat* go_v        [[buffer(7)]],
+    device bfloat* grad_comb         [[buffer(8)]],
+    device bfloat* di                [[buffer(9)]],
+    constant uint3& sc [[buffer(10)]], constant uint3& sgc [[buffer(11)]],
+    constant uint4& sq [[buffer(12)]], constant uint4& sk [[buffer(13)]], constant uint4& sv [[buffer(14)]],
+    constant uint& T [[buffer(15)]],
+    constant uint& NH [[buffer(16)]], constant uint& NKVH [[buffer(17)]],
+    constant uint& Da [[buffer(18)]], constant uint& r [[buffer(19)]],
+    threadgroup atomic_uint* smem_g_l [[threadgroup(0)]],
+    uint3 id [[thread_position_in_grid]]
+) {
+    const uint b = id.x; const uint h_glob = id.y; const uint d = id.z;
+    const uint D = Da * r;
+    const uint total_h = NH + 2 * NKVH;
+    const uint offset_l = total_h * D;
+    const uint h_loc_mapped = (h_glob < NH) ? h_glob : (h_glob < NH + NKVH ? h_glob - NH : h_glob - (NH + NKVH));
+    const uint offset_in_row = (h_glob < NH) ? 0 : (h_glob < NH + NKVH ? NH * D : (NH + NKVH) * D);
+    const uint da_idx = d / r;
+
+    Pointers<bfloat> p = get_ptrs<bfloat>(combined, h_fwd_q, h_fwd_k, h_fwd_v, go_q, go_k, go_v, sc, sq, sk, sv, b, h_glob, d, Da, r, T, NH, NKVH);
+    
+    uint g_x_idx = (b * sgc.x) + ((T-1) * sgc.y) + (offset_in_row + h_loc_mapped * D + d) * sgc.z;
+    uint g_l_idx = (b * sgc.x) + ((T-1) * sgc.y) + (offset_l + h_glob * Da + da_idx) * sgc.z;
+
+    const uint g_l_idx_leader = metal::simd_broadcast_first(g_l_idx);
+    const bool group_is_uniform = metal::simd_all(g_l_idx == g_l_idx_leader);
+
+    device const bfloat* h_fwd_base = (h_glob < NH) ? h_fwd_q : (h_glob < NH + NKVH ? h_fwd_k : h_fwd_v);
+    
+    if (d < Da) { atomic_store_float_tg(&smem_g_l[d], 0.0f); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float gh_rec = 0.0f;
+    for (int t = (int)T - 1; t > 0; t--) {
+        const float alpha = 1.0f / (1.0f + exp(-(float)(*p.l)));
+        const float gh_t = (float)(*p.tr) + gh_rec;
+        grad_comb[g_x_idx] = (bfloat)(gh_t * alpha);
+        const float d_logit = gh_t * ((float)(*p.x) - (float)h_fwd_base[p.h_fwd_off]) * (alpha * (1.0f - alpha));
+        if (group_is_uniform) {
+            float summed = simd_sum(d_logit);
+            if (simd_is_first()) { atomic_add_float_tg(&smem_g_l[da_idx], summed); }
+        } else {
+            atomic_add_float_tg(&smem_g_l[da_idx], d_logit);
+        }
+        gh_rec = gh_t * (1.0f - alpha);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (d == da_idx * r) {
+            grad_comb[g_l_idx] = (bfloat)atomic_load_float_tg(&smem_g_l[da_idx]);
+            atomic_store_float_tg(&smem_g_l[da_idx], 0.0f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        p.x -= sc.y; p.l -= sc.y; p.tr -= (h_glob < NH ? sq.z : (h_glob < NH + NKVH ? sk.z : sv.z));
+        g_x_idx -= sgc.y; g_l_idx -= sgc.y; p.h_fwd_off -= D;
+    }
+    // t=0
+    const float alpha = 1.0f / (1.0f + exp(-(float)(*p.l)));
+    const float gh_t = (float)(*p.tr) + gh_rec;
+    grad_comb[g_x_idx] = (bfloat)(gh_t * alpha);
+    const float d_logit = gh_t * ((float)(*p.x) - (float)inits[b * total_h * D + h_glob * D + d]) * (alpha * (1.0f - alpha));
+    if (group_is_uniform) {
+        float summed = simd_sum(d_logit);
+        if (simd_is_first()) { atomic_add_float_tg(&smem_g_l[da_idx], summed); }
+    } else {
+        atomic_add_float_tg(&smem_g_l[da_idx], d_logit);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (d == da_idx * r) { grad_comb[g_l_idx] = (bfloat)atomic_load_float_tg(&smem_g_l[da_idx]); }
+    di[b * total_h * D + h_glob * D + d] = (bfloat)(gh_t * (1.0f - alpha));
+}

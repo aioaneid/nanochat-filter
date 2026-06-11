@@ -2,8 +2,10 @@
 A number of functions that help with evaluating a base model.
 """
 import math
+import pathlib
 import torch
 import torch.distributed as dist
+from nanochat.train_utils import sleep_if_paused
 
 @torch.no_grad()
 def evaluate_bpb(model, batches, steps, token_bytes):
@@ -28,7 +30,9 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     total_nats = torch.tensor(0.0, dtype=torch.float32, device=model.get_device())
     total_bytes = torch.tensor(0, dtype=torch.int64, device=model.get_device())
     batch_iter = iter(batches)
+    pause_file = pathlib.Path("/tmp/loss_eval.pause")
     for _ in range(steps):
+        sleep_if_paused(pause_file)
         x, y = next(batch_iter)
         loss2d = model(x, y, loss_reduction='none') # (B, T)
         loss2d = loss2d.view(-1) # flatten

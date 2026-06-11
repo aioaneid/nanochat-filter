@@ -1,0 +1,146 @@
+#include "ltv_blelloch_affine_scan.mslh"
+
+// -------------------------------------------------------------------------
+// Templated Blelloch Time-Variable Low Pass Filter Kernel (Chunked)
+// -------------------------------------------------------------------------
+template <typename T_in, typename T_compute, typename T_out>
+kernel void ltv_fused_concat_register_cast_blelloch_scan_forward(
+    device const T_in* combined      [[buffer(0)]],
+    device const T_in* inits         [[buffer(1)]],
+    device T_out* out_q              [[buffer(2)]], 
+    device T_out* out_k              [[buffer(3)]], 
+    device T_out* out_v              [[buffer(4)]], 
+    constant uint3& sc               [[buffer(5)]], 
+    constant uint& B                 [[buffer(6)]],
+    constant uint& T_seq             [[buffer(7)]],
+    constant uint& NH                [[buffer(8)]],
+    constant uint& NKVH              [[buffer(9)]],
+    constant uint& Da                [[buffer(10)]], 
+    constant uint& r                 [[buffer(11)]], 
+    constant uint& chunk_size        [[buffer(12)]], 
+    constant uint& c                 [[buffer(13)]],
+    constant bool& use_sigmoid       [[buffer(14)]],
+    // Threadgroup memory for in-place affine states (L(h) = alpha * h + x)
+    threadgroup T_compute* b_alpha   [[threadgroup(0)]],
+    threadgroup T_compute* b_x       [[threadgroup(1)]],
+    uint3 block_id [[threadgroup_position_in_grid]],
+    uint3 tid       [[thread_position_in_threadgroup]],
+    uint lane_id   [[thread_index_in_simdgroup]]
+) {
+    const uint b_idx  = block_id.x; 
+    const uint h_glob = block_id.y; 
+    const uint d_idx  = block_id.z;
+
+    const uint tid_idx = tid.x;
+
+    uint d_simd = tid_idx - lane_id;
+    bool group_is_uniform = (simd_sum(1u) == c) &&
+                            (simd_max(lane_id) - simd_min(lane_id) == c - 1) &&
+                            (simd_max(d_simd) == simd_min(d_simd)) &&
+                            (simd_min(tid_idx / c) == simd_max(tid_idx / c)) &&
+                            (simd_min(b_idx) == simd_max(b_idx)) &&
+                            (simd_min(h_glob) == simd_max(h_glob)) &&
+                            (simd_min(d_idx) == simd_max(d_idx));
+    // group_is_uniform = false;
+    
+    const uint D = Da * r;
+    const uint total_h = NH + 2 * NKVH;
+    const uint da_idx = d_idx / r; 
+
+    // 1. Determine target output and relative head index
+    device T_out* x_out;
+    uint h_loc, h_comp_total, offset_in_row;
+
+    if (h_glob < NH) { 
+        x_out = out_q; h_loc = h_glob; h_comp_total = NH; 
+        offset_in_row = 0;
+    } else if (h_glob < NH + NKVH) { 
+        x_out = out_k; h_loc = h_glob - NH; h_comp_total = NKVH; 
+        offset_in_row = NH * D;
+    } else { 
+        x_out = out_v; h_loc = h_glob - (NH + NKVH); h_comp_total = NKVH; 
+        offset_in_row = (NH + NKVH) * D;
+    }
+
+    // 2. Pre-calculate invariant base indices using provided strides (sc)
+    const uint b_offset_combined = b_idx * sc.x;
+    const uint offset_l = (NH + 2 * NKVH) * D;
+
+    // Persistent state across multiple passes/chunks
+    T_compute running_h = (T_compute)inits[b_idx * (total_h * D) + h_glob * D + d_idx];
+
+    // Threadgroup variables to broadcast the total affine transformation of the chunk
+    threadgroup T_compute chunk_total_a;
+    threadgroup T_compute chunk_total_x;
+
+    for (uint t_base = 0; t_base < T_seq; t_base += chunk_size) {
+        uint global_t = t_base + tid_idx;
+        T_compute a_i = 1.0;
+        T_compute x_i = 0.0;
+
+        // 3. Populate Padded Buffer (In-place)
+        if (global_t < T_seq) {
+            uint val_idx   = b_offset_combined + (offset_in_row + h_loc * D + d_idx) * sc.z + global_t * sc.y;
+            uint logit_idx = b_offset_combined + (offset_l + h_glob * Da + da_idx) * sc.z + global_t * sc.y;
+
+            T_compute x_val = (T_compute)combined[val_idx];
+            T_compute l_raw = (T_compute)combined[logit_idx];
+            
+            T_compute alpha_gate = use_sigmoid
+                ? (1.0 / (1.0 + metal::exp(-l_raw)))
+                : l_raw;
+            a_i = 1.0 - alpha_gate;
+            x_i = alpha_gate * x_val;
+
+            b_alpha[BANK_IDX(tid_idx)] = a_i;
+            b_x[BANK_IDX(tid_idx)]     = x_i;
+        } else {
+            b_alpha[BANK_IDX(tid_idx)] = 1.0;
+            b_x[BANK_IDX(tid_idx)]     = 0.0;
+        }
+
+        // Delegate to Shared Logic
+        blelloch_affine_scan(
+            b_alpha, b_x,
+            chunk_total_a, chunk_total_x,
+            tid_idx, group_is_uniform,
+            chunk_size, c
+        );
+
+        // --- Phase 3: WRITE BACK ---
+        if (global_t < T_seq) {
+            // b_alpha and b_x accurately house the exclusive prefix properties for THIS chunk
+            T_compute alpha_pref = b_alpha[BANK_IDX(tid_idx)];
+            T_compute x_pref     = b_x[BANK_IDX(tid_idx)];
+
+            // Apply the previous chunks' running state (running_h) as the base value
+            T_compute h_i = a_i * (alpha_pref * running_h + x_pref) + x_i;
+
+            uint out_idx = b_idx * (h_comp_total * T_seq * D) + h_loc * (T_seq * D) + d_idx + global_t * D;
+            x_out[out_idx] = (T_out)h_i;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        
+        // --- Advance Global State ---
+        running_h = chunk_total_a * running_h + chunk_total_x;
+    }
+}
+
+// -------------------------------------------------------------------------
+// Explicit Instantiations 
+// -------------------------------------------------------------------------
+template [[host_name("ltv_fused_concat_register_cast_blelloch_scan_forward_bf16_f32_bf16")]]
+kernel void ltv_fused_concat_register_cast_blelloch_scan_forward<bfloat, float, bfloat>(
+    device const bfloat*, device const bfloat*, device bfloat*, device bfloat*, device bfloat*,
+    constant uint3&, constant uint&, constant uint&, constant uint&, constant uint&, constant uint&, constant uint&, constant uint&,
+    constant uint&, constant bool&,
+    threadgroup float*, threadgroup float*, uint3, uint3, uint
+);
+
+template [[host_name("ltv_fused_concat_register_cast_blelloch_scan_forward_f32_f32_f32")]]
+kernel void ltv_fused_concat_register_cast_blelloch_scan_forward<float, float, float>(
+    device const float*, device const float*, device float*, device float*, device float*,
+    constant uint3&, constant uint&, constant uint&, constant uint&, constant uint&, constant uint&, constant uint&, constant uint&,
+    constant uint&, constant bool&,
+    threadgroup float*, threadgroup float*, uint3, uint3, uint
+);

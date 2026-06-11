@@ -48,7 +48,7 @@ setup_default_logging()
 logger = logging.getLogger(__name__)
 
 def get_base_dir():
-    # co-locate nanochat intermediates with other cached data in ~/.cache (by default)
+    # co-locate nanochat intermediates with other cached data in $HOME/.cache (by default)
     if os.environ.get("NANOCHAT_BASE_DIR"):
         nanochat_dir = os.environ.get("NANOCHAT_BASE_DIR")
     else:
@@ -170,7 +170,8 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
 
     # Precision
     if device_type == "cuda":
-        torch.backends.cuda.matmul.fp32_precision = "tf32" # uses tf32 instead of fp32 for matmuls
+        # torch.backends.cuda.matmul.fp32_precision = "tf32" # uses tf32 instead of fp32 for matmuls
+        torch.set_float32_matmul_precision('high')
 
     # Distributed setup: Distributed Data Parallel (DDP), optional, and requires CUDA
     is_ddp_requested, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()

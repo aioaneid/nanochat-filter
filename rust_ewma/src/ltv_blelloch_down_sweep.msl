@@ -1,0 +1,79 @@
+#include <metal_stdlib>
+using namespace metal;
+
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void down_sweep_kernel(
+    device const float* stack_a      [[buffer(0)]],
+    device const float* stack_x      [[buffer(1)]],
+    device const float* carry_a      [[buffer(2)]],
+    device const float* carry_x      [[buffer(3)]],
+    device float* output_a           [[buffer(4)]],
+    device float* output_x           [[buffer(5)]],
+    constant uint&      t_orig       [[buffer(6)]],
+    constant uint&      chunk_size   [[buffer(7)]],
+    constant uint&      r            [[buffer(8)]],
+    constant uint&      t_padded     [[buffer(9)]], // Added to calculate summary strides
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint3 tid    [[thread_position_in_threadgroup]]
+) {
+    uint chunk_idx = tg_pos.x;   // Time Dimension (Chunks)
+    uint line_id_x = tg_pos.y;   // Spatial Dimension (Parallel Lines)
+    uint unit_idx  = tid.x;      // Thread within chunk
+
+    uint line_id_a = line_id_x / r;
+    bool is_index_zero_of_r = (line_id_a * r == line_id_x);
+
+    // Carry Load (Shared among the threadgroup)
+    threadgroup float shm_carry_a;
+    threadgroup float shm_carry_x;
+
+    if (unit_idx == 0) {
+        if (chunk_idx > 0) {
+            // Summary layout: (Spatial, n_chunks). Stride is n_chunks.
+            uint n_chunks = t_padded / chunk_size;
+            
+            if (is_index_zero_of_r) {
+                uint carry_idx_a = line_id_a * n_chunks + (chunk_idx - 1);
+                shm_carry_a = carry_a[carry_idx_a];
+            }
+            uint carry_idx_x = line_id_x * n_chunks + (chunk_idx - 1);
+            shm_carry_x = carry_x[carry_idx_x];
+        } else {
+            // First chunk uses initial state
+            if (is_index_zero_of_r) {
+                shm_carry_a = 1.0f;
+            }
+            shm_carry_x = 0.0f;
+        }
+    }
+
+    // Synchronize to ensure shm_carry is loaded
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Calculate indices for every thread in the chunk
+    uint global_t = chunk_idx * chunk_size + unit_idx;
+
+    // Spatial-Major Indexing: line * T + t
+    if (global_t < t_orig) {
+        uint idx_a = line_id_a * t_orig + global_t;
+        uint idx_x = line_id_x * t_orig + global_t;
+
+        uint idx_a_stack = line_id_a * t_padded + global_t;
+        uint idx_x_stack = line_id_x * t_padded + global_t;
+
+        // Load from stack (Up-sweep results)
+        float s_a = stack_a[idx_a_stack];
+        float s_x = stack_x[idx_x_stack];
+
+        // Compose: carry_in ⊗ local_scan
+        float res_x = s_a * shm_carry_x + s_x;
+
+        if (is_index_zero_of_r) {
+            float res_a = s_a * shm_carry_a;
+            output_a[idx_a] = res_a;
+        }
+        output_x[idx_x] = res_x;
+    }
+}

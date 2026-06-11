@@ -7,3 +7,7 @@ eval_bundle/
 
 # Secrets
 .env
+
+# Built artifacts
+nanochat.egg-info/
+rust_ewma/target/

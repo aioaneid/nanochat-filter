@@ -1,0 +1,10 @@
+[build-system]
+# We need torch and setuptools present during the build to compile CUDA
+requires = ["setuptools", "torch", "numpy", "ninja", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cpp_ewma"
+version = "0.1.0"
+description = "Fused CUDA kernels for EWMA"
+dependencies = ["torch"]

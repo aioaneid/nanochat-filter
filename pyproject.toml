@@ -1,36 +1,52 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "nanochat"
 version = "0.1.0"
 description = "the minimal full-stack ChatGPT clone"
 readme = "README.md"
 requires-python = ">=3.10"
+
 dependencies = [
+    "arrgh>=1.0.0",
     "datasets>=4.0.0",
     "fastapi>=0.117.1",
     "ipykernel>=7.1.0",
     "matplotlib>=3.10.8",
+    "ndjson>=0.3.1",
+    "pandas>=2.3.2",
     "psutil>=7.1.0",
     "python-dotenv>=1.2.1",
     "regex>=2025.9.1",
     "rustbpe>=0.1.0",
     "setuptools>=80.9.0",
+    "tensorboard>=2.20.0",
     "tiktoken>=0.11.0",
     "tokenizers>=0.22.0",
     "torch>=2.9.0",
     "transformers>=4.57.3",
     "uvicorn>=0.36.0",
     "wandb>=0.21.3",
+    "rust_ewma",
+    "enum-actions>=0.1.2",
+    "strenum>=0.4.15",
 ]
 
 [dependency-groups]
 dev = [
+    "files-to-prompt>=0.6",
+    "maturin>=1.9.4",
+    "modal>=1.4.2",
     "pytest>=8.0.0",
+    "pytest-regex>=0.2.0",
+    "pytest-repeat>=0.9.4",
+    "pytest-timeout>=2.4.0",
 ]
 
 [tool.pytest.ini_options]
-markers = [
-    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
-]
+markers = ["slow: marks tests as slow (deselect with '-m \"not slow\"')"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
@@ -43,6 +59,9 @@ torch = [
     { index = "pytorch-cu128", extra = "gpu" },
 ]
 
+rust_ewma = { path = "./rust_ewma", editable = true }
+cpp_ewma = { path = "./cpp_ewma", editable = true }
+
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
@@ -53,18 +72,32 @@ name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
+# ---------------------------------------------------------------------
+# Optional dependency sets (platform-safe)
+# ---------------------------------------------------------------------
+
 [project.optional-dependencies]
-cpu = [
-    "torch>=2.9.1",
-]
+cpu = ["torch>=2.9.1"]
 gpu = [
     "torch>=2.9.1",
+    "cpp_ewma",
 ]
 
-[tool.uv]
-conflicts = [
-    [
-        { extra = "cpu" },
-        { extra = "gpu" },
-    ],
+# Apple Silicon (MPS)
+mps = [
+    "torch>=2.9.1; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
+
+# ---------------------------------------------------------------------
+# uv conflict rules
+# ---------------------------------------------------------------------
+
+[tool.uv]
+conflicts = [[{ extra = "cpu" }, { extra = "gpu" }, { extra = "mps" }]]
+
+[tool.setuptools.packages.find]
+include = ["nanochat*", "scripts*"]
+
+[project.scripts]
+# Format: command_name = "package.module:function"
+bench_gpt_ltv = "nanochat.bench.bench_gpt_ltv:main"

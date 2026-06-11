@@ -1,0 +1,234 @@
+kernel void ltv_fused_scan_backward_atomic(
+    device const float* x_q [[buffer(0)]],
+    device const float* x_k [[buffer(1)]],
+    device const float* x_v [[buffer(2)]],
+    device const float* l [[buffer(3)]],
+    device const float* i [[buffer(4)]],
+    device const float* h_fwd_q [[buffer(5)]],
+    device const float* h_fwd_k [[buffer(6)]],
+    device const float* h_fwd_v [[buffer(7)]],
+    device const float* go_q [[buffer(8)]],
+    device const float* go_k [[buffer(9)]],
+    device const float* go_v [[buffer(10)]],
+    device float* dx_q [[buffer(11)]],
+    device float* dx_k [[buffer(12)]],
+    device float* dx_v [[buffer(13)]],
+    device metal::atomic_float* dl [[buffer(14)]],
+    device float* di [[buffer(15)]],
+    constant uint4& sq [[buffer(16)]],
+    constant uint4& sk [[buffer(17)]],
+    constant uint4& sv [[buffer(18)]],
+    constant uint& B [[buffer(19)]],
+    constant uint& T [[buffer(20)]],
+    constant uint& NH [[buffer(21)]],
+    constant uint& NKVH [[buffer(22)]],
+    constant uint& Da [[buffer(23)]],
+    constant uint& r [[buffer(24)]],
+    uint3 id [[thread_position_in_grid]]
+) {
+    const uint b = id.x;
+    const uint h_glob = id.y;
+    const uint d = id.z;
+    const uint D = Da * r;
+    const uint total_h = NH + 2 * NKVH;
+    const uint last_t = T - 1;
+    const uint da_idx = d / r;
+    device const float *x_base;
+    device const float *h_base;
+    device const float *go_base;
+    device float *dx_base;
+    uint h_loc;
+    uint h_comp_total;
+    uint4 s;
+    if (h_glob < NH) {
+        x_base = x_q;
+        h_base = h_fwd_q;
+        go_base = go_q;
+        dx_base = dx_q;
+        h_loc = h_glob;
+        h_comp_total = NH;
+        s = sq;
+    } else if (h_glob < NH + NKVH) {
+        x_base = x_k;
+        h_base = h_fwd_k;
+        go_base = go_k;
+        dx_base = dx_k;
+        h_loc = h_glob - NH;
+        h_comp_total = NKVH;
+        s = sk;
+    } else {
+        x_base = x_v;
+        h_base = h_fwd_v;
+        go_base = go_v;
+        dx_base = dx_v;
+        h_loc = h_glob - (NH + NKVH);
+        h_comp_total = NKVH;
+        s = sv;
+    }
+    const uint l_stride = total_h * Da;
+    const uint in_stride = h_comp_total * D;
+    const uint h_stride = D;
+    const uint go_stride = s.z;
+    device const float* l_ptr = l + (b * T * total_h * Da) + (last_t * l_stride) + (h_glob * Da + da_idx);
+    device const float* x_ptr = x_base + (b * T * h_comp_total * D) + (last_t * in_stride) + (h_loc * D + d);
+    device float* dx_ptr = dx_base + (b * T * h_comp_total * D) + (last_t * in_stride) + (h_loc * D + d);
+    device const float* go_ptr_t = go_base + (b * s.x + h_loc * s.y + last_t * s.z + d * s.w);
+    uint dl_offset = (b * T * total_h * Da) + (last_t * l_stride) + (h_glob * Da + da_idx);
+    device const float* h_ptr = h_base + (b * h_comp_total * T * D) + (h_loc * T * D) + ((last_t - 1) * h_stride) + d;
+    float gh_recursive = 0.0f;
+
+    const uint dl_offset_leader = metal::simd_broadcast_first(dl_offset);
+    // We do not know how simd_all and simd_sum are treated when the group has inactive threads.
+    // But let's assume that either:
+    // - The mask threads are completely ignored, or 
+    // - They claim to have all variables equal to zero, i.e. dl_offset = d_logit = 0.
+    // This should work correctly in both cases.
+    const bool group_is_uniform = metal::simd_all(dl_offset == dl_offset_leader);
+
+    for (int t = (int)last_t; t > 0; t--) {
+        const float alpha = 1.0f / (1.0f + metal::exp(-(*l_ptr)));
+        const float gh_t = (*go_ptr_t) + gh_recursive;
+        *dx_ptr = gh_t * alpha;
+        const float d_logit = (gh_t * ((*x_ptr) - (*h_ptr))) * (alpha * (1.0f - alpha));
+
+        if (group_is_uniform) {
+            float summed = metal::simd_sum(d_logit);
+            if (metal::simd_is_first()) {
+                metal::atomic_fetch_add_explicit(dl + dl_offset, summed, metal::memory_order_relaxed);
+            }
+        } else {
+            metal::atomic_fetch_add_explicit(dl + dl_offset, d_logit, metal::memory_order_relaxed);
+        }
+
+        gh_recursive = gh_t * (1.0f - alpha);
+        l_ptr -= l_stride;
+        x_ptr -= in_stride;
+        dx_ptr -= in_stride;
+        go_ptr_t -= go_stride;
+        dl_offset -= l_stride;
+        h_ptr -= h_stride;
+    }
+    {
+        const float alpha = 1.0f / (1.0f + metal::exp(-(*l_ptr)));
+        const float gh_t = (*go_ptr_t) + gh_recursive;
+        *dx_ptr = gh_t * alpha;
+        const float init_val = i[b * total_h * D + h_glob * D + d];
+        const float d_logit = (gh_t * ((*x_ptr) - init_val)) * (alpha * (1.0f - alpha));
+
+        if (group_is_uniform) {
+            float summed = metal::simd_sum(d_logit);
+            if (metal::simd_is_first()) {
+                metal::atomic_fetch_add_explicit(dl + dl_offset, summed, metal::memory_order_relaxed);
+            }
+        } else {
+            metal::atomic_fetch_add_explicit(dl + dl_offset, d_logit, metal::memory_order_relaxed);
+        }
+
+        gh_recursive = gh_t * (1.0f - alpha);
+    }
+    di[b * total_h * D + h_glob * D + d] = gh_recursive;
+}
+
+kernel void ltv_fused_scan_backward_direct(
+    device const float* x_q [[buffer(0)]],
+    device const float* x_k [[buffer(1)]],
+    device const float* x_v [[buffer(2)]],
+    device const float* l [[buffer(3)]],
+    device const float* i [[buffer(4)]],
+    device const float* h_fwd_q [[buffer(5)]],
+    device const float* h_fwd_k [[buffer(6)]],
+    device const float* h_fwd_v [[buffer(7)]],
+    device const float* go_q [[buffer(8)]],
+    device const float* go_k [[buffer(9)]],
+    device const float* go_v [[buffer(10)]],
+    device float* dx_q [[buffer(11)]],
+    device float* dx_k [[buffer(12)]],
+    device float* dx_v [[buffer(13)]],
+    device float* dl [[buffer(14)]],
+    device float* di [[buffer(15)]],
+    constant uint4& sq [[buffer(16)]],
+    constant uint4& sk [[buffer(17)]],
+    constant uint4& sv [[buffer(18)]],
+    constant uint& B [[buffer(19)]],
+    constant uint& T [[buffer(20)]],
+    constant uint& NH [[buffer(21)]],
+    constant uint& NKVH [[buffer(22)]],
+    constant uint& Da [[buffer(23)]],
+    constant uint& r [[buffer(24)]],
+    uint3 id [[thread_position_in_grid]]
+) {
+    const uint b = id.x;
+    const uint h_glob = id.y;
+    const uint d = id.z;
+    const uint D = Da * r;
+    const uint total_h = NH + 2 * NKVH;
+    const uint last_t = T - 1;
+    const uint da_idx = d;
+    device const float *x_base;
+    device const float *h_base;
+    device const float *go_base;
+    device float *dx_base;
+    uint h_loc;
+    uint h_comp_total;
+    uint4 s;
+    if (h_glob < NH) {
+        x_base = x_q;
+        h_base = h_fwd_q;
+        go_base = go_q;
+        dx_base = dx_q;
+        h_loc = h_glob;
+        h_comp_total = NH;
+        s = sq;
+    } else if (h_glob < NH + NKVH) {
+        x_base = x_k;
+        h_base = h_fwd_k;
+        go_base = go_k;
+        dx_base = dx_k;
+        h_loc = h_glob - NH;
+        h_comp_total = NKVH;
+        s = sk;
+    } else {
+        x_base = x_v;
+        h_base = h_fwd_v;
+        go_base = go_v;
+        dx_base = dx_v;
+        h_loc = h_glob - (NH + NKVH);
+        h_comp_total = NKVH;
+        s = sv;
+    }
+    const uint l_stride = total_h * Da;
+    const uint in_stride = h_comp_total * D;
+    const uint h_stride = D;
+    const uint go_stride = s.z;
+    device const float* l_ptr = l + (b * T * total_h * Da) + (last_t * l_stride) + (h_glob * Da + da_idx);
+    device const float* x_ptr = x_base + (b * T * h_comp_total * D) + (last_t * in_stride) + (h_loc * D + d);
+    device float* dx_ptr = dx_base + (b * T * h_comp_total * D) + (last_t * in_stride) + (h_loc * D + d);
+    device const float* go_ptr_t = go_base + (b * s.x + h_loc * s.y + last_t * s.z + d * s.w);
+    device float* dl_ptr = dl + (b * T * total_h * Da) + (last_t * l_stride) + (h_glob * Da + da_idx);
+    device const float* h_ptr = h_base + (b * h_comp_total * T * D) + (h_loc * T * D) + ((last_t - 1) * h_stride) + d;
+    float gh_recursive = 0.0f;
+    for (int t = (int)last_t; t > 0; t--) {
+        const float alpha = 1.0f / (1.0f + metal::exp(-(*l_ptr)));
+        const float gh_t = (*go_ptr_t) + gh_recursive;
+        *dx_ptr = gh_t * alpha;
+        const float d_logit = (gh_t * ((*x_ptr) - (*h_ptr))) * (alpha * (1.0f - alpha));
+        *dl_ptr = d_logit;
+        gh_recursive = gh_t * (1.0f - alpha);
+        l_ptr -= l_stride;
+        x_ptr -= in_stride;
+        dx_ptr -= in_stride;
+        go_ptr_t -= go_stride;
+        dl_ptr -= l_stride;
+        h_ptr -= h_stride;
+    }
+    {
+        const float alpha = 1.0f / (1.0f + metal::exp(-(*l_ptr)));
+        const float gh_t = (*go_ptr_t) + gh_recursive;
+        *dx_ptr = gh_t * alpha;
+        const float init_val = i[b * total_h * D + h_glob * D + d];
+        const float d_logit = (gh_t * ((*x_ptr) - init_val)) * (alpha * (1.0f - alpha));
+        *dl_ptr = d_logit;
+        gh_recursive = gh_t * (1.0f - alpha);
+    }
+    di[b * total_h * D + h_glob * D + d] = gh_recursive;
+}

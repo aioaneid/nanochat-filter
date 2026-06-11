@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # The $1000 tier of nanochat
 # Designed to run end-to-end for $1000/24 ~= 41.6 hours on an 8XH100 node
@@ -19,7 +19,7 @@ python -m nanochat.report reset
 curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
 
 # train tokenizer on ~4B characters and kick off download of the rest for pretraining
-python -m nanochat.dataset -n 16
+python -m nanochat.dataset -n 21
 # start downloading the rest of the shards for a total of 800 (see below why 800)
 python -m nanochat.dataset -n 800 &
 # todo: download the rest of it

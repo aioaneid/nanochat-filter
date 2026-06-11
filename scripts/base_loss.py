@@ -8,10 +8,16 @@ torchrun --standalone --nproc_per_node=8 -m scripts.base_loss
 """
 import argparse
 from contextlib import nullcontext
+from enum_actions import enum_action
 import torch
 from nanochat.checkpoint_manager import load_model
 from nanochat.common import compute_init, print0, compute_cleanup, autodetect_device_type
 from nanochat.dataloader import tokenizing_distributed_data_loader
+try:
+    import rust_ewma
+except ImportError:
+    rust_ewma = None
+from nanochat.gpt_factory import LtvSplitMode, ModelType, one_time_model_factory
 from nanochat.tokenizer import get_token_bytes
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
@@ -23,14 +29,28 @@ parser.add_argument("--split_tokens", type=int, default=20*524288, help="number 
 parser.add_argument("--model_tag", type=str, default=None, help="model tag for checkpoint directory")
 parser.add_argument("--model_step", type=int, default=None, help="model step to load")
 parser.add_argument("--device_type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+parser.add_argument('--model_type', action=enum_action(ModelType), default=ModelType.ORIGINAL)
+parser.add_argument('--ltv_query', action=enum_action(LtvSplitMode), default=LtvSplitMode.NONE)
+parser.add_argument('--ltv_key', action=enum_action(LtvSplitMode), default=LtvSplitMode.NONE)
+parser.add_argument('--ltv_value', action=enum_action(LtvSplitMode), default=LtvSplitMode.NONE)
+parser.add_argument("--report_name", type=str, default="report")
 args = parser.parse_args()
 
 # Load the base model and the tokenizer
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
-model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.model_step)
+model, tokenizer, meta = load_model(
+    one_time_model_factory(
+        args.model_type, args.ltv_query, args.ltv_key, args.ltv_value
+    ),
+    "base",
+    device,
+    phase="eval",
+    model_tag=args.model_tag,
+    step=args.model_step,
+)
 sequence_len = meta["model_config"]["sequence_len"] # could be arbitrary really
-autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
+autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type in ["cuda", "mps"] else nullcontext()
 
 # Evaluate the loss on each split
 tokens_per_step = args.device_batch_size * sequence_len * ddp_world_size
@@ -68,7 +88,7 @@ if ddp_rank == 0:
 
 # Log to report
 from nanochat.report import get_report
-get_report().log(section="Base model loss", data=[
+get_report(args.report_name).log(section="Base model loss", data=[
     {
         "train bpb": bpb_results["train"],
         "val bpb": bpb_results["val"],

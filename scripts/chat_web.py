@@ -33,6 +33,7 @@ Abuse Prevention:
 import argparse
 import json
 import os
+from enum_actions import enum_action
 import torch
 import asyncio
 import logging
@@ -48,6 +49,11 @@ from contextlib import nullcontext
 from nanochat.common import compute_init, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
 from nanochat.engine import Engine
+try:
+    import rust_ewma
+except ImportError:
+    rust_ewma = None
+from nanochat.gpt_factory import LtvSplitMode, ModelType, one_time_model_factory
 
 # Abuse prevention limits
 MAX_MESSAGES_PER_REQUEST = 500
@@ -66,12 +72,16 @@ parser.add_argument('-i', '--source', type=str, default="sft", help="Source of t
 parser.add_argument('-t', '--temperature', type=float, default=0.8, help='Default temperature for generation')
 parser.add_argument('-k', '--top-k', type=int, default=50, help='Default top-k sampling parameter')
 parser.add_argument('-m', '--max-tokens', type=int, default=512, help='Default max tokens for generation')
-parser.add_argument('-g', '--model-tag', type=str, default=None, help='Model tag to load')
+parser.add_argument('-g', '--model-tag', '--model_tag', type=str, default=None, help='Model tag to load')
 parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
 parser.add_argument('-p', '--port', type=int, default=8000, help='Port to run the server on')
 parser.add_argument('-d', '--dtype', type=str, default='bfloat16', choices=['float32', 'bfloat16'])
 parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
 parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to bind the server to')
+parser.add_argument('--model_type', action=enum_action(ModelType), default=ModelType.ORIGINAL)
+parser.add_argument('--ltv_query', action=enum_action(LtvSplitMode), default=LtvSplitMode.NONE)
+parser.add_argument('--ltv_key', action=enum_action(LtvSplitMode), default=LtvSplitMode.NONE)
+parser.add_argument('--ltv_value', action=enum_action(LtvSplitMode), default=LtvSplitMode.NONE)
 args = parser.parse_args()
 
 # Configure logging for conversation traffic
@@ -123,9 +133,18 @@ class WorkerPool:
                 device = torch.device(device_type) # e.g. cpu|mps
                 print(f"Loading model on {device_type}...")
 
-            model, tokenizer, _ = load_model(source, device, phase="eval", model_tag=model_tag, step=step)
+            model, tokenizer, _ = load_model(
+                one_time_model_factory(
+                    args.model_type, args.ltv_query, args.ltv_key, args.ltv_value
+                ),
+                source,
+                device,
+                phase="eval",
+                model_tag=model_tag,
+                step=step,
+            )
             engine = Engine(model, tokenizer)
-            autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
+            autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type in ["cuda", "mps"] else nullcontext()
 
             worker = Worker(
                 gpu_id=gpu_id,

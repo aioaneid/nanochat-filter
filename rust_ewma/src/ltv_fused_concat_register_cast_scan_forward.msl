@@ -1,0 +1,75 @@
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void ltv_fused_concat_register_cast_scan_forward(
+    device const bfloat* combined   [[buffer(0)]],
+    device const bfloat* inits      [[buffer(1)]],
+    device bfloat* out_q            [[buffer(2)]], 
+    device bfloat* out_k            [[buffer(3)]], 
+    device bfloat* out_v            [[buffer(4)]], 
+    constant uint3& sc              [[buffer(5)]], 
+    constant uint& T                [[buffer(6)]],
+    constant uint& NH               [[buffer(7)]],
+    constant uint& NKVH             [[buffer(8)]],
+    constant uint& Da               [[buffer(9)]], 
+    constant uint& r                [[buffer(10)]], 
+    uint3 id [[thread_position_in_grid]]
+) {
+    const uint b = id.x; const uint h_glob = id.y; const uint d = id.z;
+    const uint D = Da * r;
+    const uint total_h = NH + 2 * NKVH;
+    const uint da_idx = d / r; 
+
+    // 1. Determine target output and relative head index
+    device bfloat* x_out;
+    uint h_loc, h_comp_total, offset_in_row;
+
+    if (h_glob < NH) { 
+        x_out = out_q; h_loc = h_glob; h_comp_total = NH; 
+        offset_in_row = 0; // offset_q
+    } else if (h_glob < NH + NKVH) { 
+        x_out = out_k; h_loc = h_glob - NH; h_comp_total = NKVH; 
+        offset_in_row = NH * D; // offset_k
+    } else { 
+        x_out = out_v; h_loc = h_glob - (NH + NKVH); h_comp_total = NKVH; 
+        offset_in_row = (NH + NKVH) * D; // offset_v
+    }
+
+    // 2. Pre-calculate invariant base indices and strides
+    const uint b_offset_combined = b * sc.x;
+    const uint offset_l = (NH + 2 * NKVH) * D;
+
+    // Pointer starting positions at t=0
+    const uint val_idx_base   = b_offset_combined + (offset_in_row + h_loc * D + d) * sc.z;
+    const uint logit_idx_base = b_offset_combined + (offset_l + h_glob * Da + da_idx) * sc.z;
+    const uint out_idx_base   = b * (h_comp_total * T * D) + h_loc * (T * D) + d;
+
+    // 3. Initializations — cast bfloat->float for accumulator
+    float acc = (float)inits[b * (total_h * D) + h_glob * D + d];
+    // Logits are pre-biased: logits_slice.add_(self.logit_bias) done in Python before calling the op
+    
+    // Loop Invariants
+    const uint t_stride_in  = sc.y;
+    const uint t_stride_out = D;
+
+    // 4. Optimized Loop
+    uint cur_val_idx   = val_idx_base;
+    uint cur_logit_idx = logit_idx_base;
+    uint cur_out_idx   = out_idx_base;
+
+    for (uint t = 0; t < T; t++) {
+        const float x_val = (float)combined[cur_val_idx];
+        const float l_raw = (float)combined[cur_logit_idx];
+        
+        // Sigmoid/EMA logic — all math in float32
+        const float alpha = 1.0f / (1.0f + exp(-l_raw));
+        acc = (1.0f - alpha) * acc + alpha * x_val;
+        
+        x_out[cur_out_idx] = (bfloat)acc;
+
+        // Increment pointers/indices by pre-calculated strides
+        cur_val_idx   += t_stride_in;
+        cur_logit_idx += t_stride_in;
+        cur_out_idx   += t_stride_out;
+    }
+}

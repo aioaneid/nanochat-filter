@@ -12,16 +12,29 @@ torchrun --standalone --nproc_per_node=8 -m scripts.mid_train -- --device_batch_
 import argparse
 from collections import deque
 import os
+
+from enum_actions import enum_action
+
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
 import wandb
 import torch
+import pathlib
+import sys
 from contextlib import nullcontext
+from distutils.util import strtobool
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_token_bytes
+from nanochat.train_utils import sleep_if_paused
 from nanochat.checkpoint_manager import save_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.checkpoint_manager import load_model
+from nanochat.utils.tensorboard_adapter import TensorboardAdapter
+try:
+    import rust_ewma
+except ImportError:
+    rust_ewma = None
+from nanochat.gpt_factory import LtvSplitMode, ModelType, one_time_model_factory
 import torch.distributed as dist
 
 from tasks.common import TaskMixture
@@ -31,19 +44,39 @@ from tasks.smoltalk import SmolTalk
 from tasks.customjson import CustomJSON
 from tasks.spellingbee import SimpleSpelling, SpellingBee
 
+import logging
+
+root = logging.getLogger()
+root.setLevel(logging.INFO)
+
+handler = logging.StreamHandler(sys.stdout)
+handler.setLevel(logging.DEBUG)
+formatter = logging.Formatter("%(levelname)s - %(message)s")
+handler.setFormatter(formatter)
+root.addHandler(handler)
+
+logger = logging.getLogger(__name__)
+
+LOG_FACTOR = 1
+
 # -----------------------------------------------------------------------------
 # CLI arguments
 parser = argparse.ArgumentParser(description="Midtrain the model")
 # Logging
-parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+parser.add_argument("--run", type=str, default="tensorboard", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
 parser.add_argument("--device_type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 parser.add_argument("--dtype", type=str, default="bfloat16", help="float32|bfloat16")
 # Model loading
 parser.add_argument("--model_tag", type=str, default=None, help="model tag to load from")
 parser.add_argument("--model_step", type=int, default=None, help="model step to load from")
+parser.add_argument('--model_type', action=enum_action(ModelType), default=ModelType.ORIGINAL)
+parser.add_argument('--ltv_query', action=enum_action(LtvSplitMode), default=LtvSplitMode.NONE)
+parser.add_argument('--ltv_key', action=enum_action(LtvSplitMode), default=LtvSplitMode.NONE)
+parser.add_argument('--ltv_value', action=enum_action(LtvSplitMode), default=LtvSplitMode.NONE)
 # Training horizon
 parser.add_argument("--num_iterations", type=int, default=-1, help="number of optimization steps (-1 = full epoch)")
+parser.add_argument("--sync_on_mps", type=lambda v: bool(strtobool(v)), default=False)
 # Batch sizes
 parser.add_argument("--max_seq_len", type=int, default=2048, help="max context length")
 parser.add_argument("--device_batch_size", type=int, default=32, help="per-device batch size")
@@ -54,11 +87,13 @@ parser.add_argument("--unembedding_lr", type=float, default=0.004, help="learnin
 parser.add_argument("--matrix_lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay for embedding/unembedding parameters (Adam)")
 parser.add_argument("--init_lr_frac", type=float, default=1.0, help="initial LR as fraction of base LR")
+parser.add_argument("--combined_optimizers", type=lambda v: bool(strtobool(v)), default=False)
 # Evaluation
 parser.add_argument("--eval_every", type=int, default=150, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval_tokens", type=int, default=20*524288, help="number of tokens to evaluate val loss on")
 # Output
 parser.add_argument("--dry_run", action="store_true", help="log to wandb but skip checkpoints/report")
+parser.add_argument("--report_name", type=str, default="report")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -68,16 +103,26 @@ device_type = autodetect_device_type() if args.device_type == "" else args.devic
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0
 ptdtype = torch.float32 if args.dtype == 'float32' else torch.bfloat16
-autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
-synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
+autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type in ["cuda", "mps"] else nullcontext()
+synchronize = torch.cuda.synchronize if device_type == "cuda" else torch.mps.synchronize if device_type == "mps" and args.sync_on_mps else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-mid", name=args.run, config=user_config)
+wandb_run = DummyWandb() if use_dummy_wandb else TensorboardAdapter(project="nanochat-mid", name=args.run, config=user_config) if args.run.startswith("tensorboard") else wandb.init(project="nanochat-mid", name=args.run, config=user_config, save_code=True)
 
 # Load the model and tokenizer
-model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
+model, tokenizer, meta = load_model(
+    one_time_model_factory(
+        args.model_type, args.ltv_query, args.ltv_key, args.ltv_value
+    ),
+    "base",
+    device,
+    phase="train",
+    model_tag=args.model_tag,
+    step=args.model_step,
+)
+
 pretrain_batch_size = meta.get("device_batch_size", None)
 if pretrain_batch_size is not None and args.device_batch_size > pretrain_batch_size:
     print0(f"FOOTGUN WARNING: base model training used device_batch_size {pretrain_batch_size}, did you pass in a good --device_batch_size to this script?")
@@ -94,20 +139,27 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {args.total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 token_bytes = get_token_bytes(device=device)
 
-# Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
-optimizers = model.setup_optimizers(unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=args.weight_decay)
-adamw_optimizer, muon_optimizer = optimizers
-# Override the initial learning rate as a fraction of the base learning rate
-for opt in optimizers:
-    for group in opt.param_groups:
+if args.combined_optimizers:
+    # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
+    optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=args.weight_decay)
+    for group in optimizer.param_groups:
         group["lr"] = group["lr"] * args.init_lr_frac
-        group["initial_lr"] = group["lr"] # save the initial learning so we can decay easily later
+        group["initial_lr"] = group["lr"]
+else:
+    # Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
+    optimizers = model.setup_optimizers(unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=args.weight_decay)
+    adamw_optimizer, muon_optimizer = optimizers
+    # Override the initial learning rate as a fraction of the base learning rate
+    for opt in optimizers:
+        for group in opt.param_groups:
+            group["lr"] = group["lr"] * args.init_lr_frac
+            group["initial_lr"] = group["lr"] # save the initial learning so we can decay easily later
 
 # Midtraining data mixture and DataLoader
 base_dir = get_base_dir()
 identity_conversations_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
 train_dataset = TaskMixture([
-    SmolTalk(split="train"), # 460K rows of general conversations
+    SmolTalk(tokenizer, split="train"), # 460K rows of general conversations
     MMLU(subset="auxiliary_train", split="train"), # 100K rows of multiple choice problems drawn from ARC, MC_TEST, OBQA, RACE
     GSM8K(subset="main", split="train"), # 8K rows teaching simple math and (calculator) tool use
     CustomJSON(filepath=identity_conversations_filepath), # 1000 rows of synthetic identity conversations
@@ -116,7 +168,7 @@ train_dataset = TaskMixture([
     SpellingBee(size=80000, split="train"), # 80K rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
 ]) # total: 460K + 100K + 8K + 200K + 80K = 848K rows
 val_dataset = TaskMixture([
-    SmolTalk(split="test"), # 24K rows in test set
+    SmolTalk(tokenizer, split="test"), # 24K rows in test set
     MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios
     GSM8K(subset="main", split="test", stop=420), # 1.32K rows in test set, use only 420 to match the train ratios
 ]) # total: 24K + 14K + 1.32K ~= 39K rows
@@ -155,10 +207,12 @@ def mid_data_generator(split):
         # Build up inputs/targets and yield
         for i in range(needed_tokens):
             scratch[i] = token_buffer.popleft()
-        inputs_cpu = scratch[:-1].to(dtype=torch.int32)
+        use_cuda_optimizations = device == "cuda"
+        # int32 may trigger compilation on the CPU, then missing torch._inductor.bounds
+        inputs_cpu = scratch[:-1].to(dtype=torch.long)
         targets_cpu = scratch[1:]
-        inputs = inputs_cpu.view(args.device_batch_size, args.max_seq_len).to(device=device, dtype=torch.int32, non_blocking=True)
-        targets = targets_cpu.view(args.device_batch_size, args.max_seq_len).to(device=device, dtype=torch.int64, non_blocking=True)
+        inputs = inputs_cpu.view(args.device_batch_size, args.max_seq_len).to(device=device, dtype=torch.int32, non_blocking=use_cuda_optimizations)
+        targets = targets_cpu.view(args.device_batch_size, args.max_seq_len).to(device=device, dtype=torch.int64, non_blocking=use_cuda_optimizations)
         if split == "train":
             if args.num_iterations > 0:
                 approx_progress = it / args.num_iterations # calculate progress from the max number of iterations
@@ -183,13 +237,16 @@ def get_muon_momentum(it):
 
 # -----------------------------------------------------------------------------
 # Training loop
+logger.info("Training loop")
 x, y = next(train_loader) # prefetch the very first batch of data
 min_val_bpb = float("inf")
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
 step = 0
+pause_file = pathlib.Path("/tmp/mid_train.pause")
 while True:
+    sleep_if_paused(pause_file)
     flops_so_far = num_flops_per_token * args.total_batch_size * step
 
     # Synchronize last_step across all ranks to avoid hangs in the distributed setting
@@ -199,7 +256,7 @@ while True:
         last_step = bool(last_step_tensor.item())
 
     # once in a while: evaluate the val bpb (all ranks participate)
-    if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
+    if args.eval_every > 0 and (last_step or step % max(1, args.eval_every // LOG_FACTOR) == 0):
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
@@ -220,11 +277,12 @@ while True:
     if master_process and last_step and not args.dry_run:
         output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d12
         checkpoint_dir = os.path.join(base_dir, "mid_checkpoints", output_dirname)
+        model_config_kwargs = meta["model_config"]
         save_checkpoint(
             checkpoint_dir,
             step,
             orig_model.state_dict(),
-            [opt.state_dict() for opt in optimizers], # TODO: make sure saving across ranks is done correctly
+            optimizer.state_dict() if args.combined_optimizers else [opt.state_dict() for opt in optimizers],
             {
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
@@ -235,6 +293,10 @@ while True:
                     "n_head": model.config.n_head,
                     "n_kv_head": model.config.n_kv_head,
                     "n_embd": model.config.n_embd,
+                    "ltv_r": model_config_kwargs["ltv_r"],
+                    "ltv_query": model_config_kwargs["ltv_query"],
+                    "ltv_key": model_config_kwargs["ltv_key"],
+                    "ltv_value": model_config_kwargs["ltv_value"],
                 },
                 "user_config": user_config, # inputs to the training script
             }
@@ -251,21 +313,33 @@ while True:
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
             loss = model(x, y)
-        train_loss = loss.detach() # for logging
+        # The last loss will be logged, but for that it would be enough to detach(). However, for some
+        # weird, unknown reason, the loss values are huge and then NaN, if we do not synchronize here.
+        # And that happens with and without combined optimizers. Interestingly, that was not a problem in
+        # base_train. Luckily, this does not seem to affect tokens/sec.
+        train_loss = loss.item()
+        logger.debug("micro_step: %d loss: %s", micro_step, train_loss)
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
         x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
         progress = max(progress, approx_progress) # only increase progress monotonically
     # step the optimizers
     lrm = get_lr_multiplier(progress)
-    for opt in optimizers:
-        for group in opt.param_groups:
-            group["lr"] = group["initial_lr"] * lrm
     muon_momentum = get_muon_momentum(step)
-    for group in muon_optimizer.param_groups:
-        group["momentum"] = muon_momentum
-    for opt in optimizers:
-        opt.step()
+    if args.combined_optimizers:
+        for group in optimizer.param_groups:
+            group["lr"] = group["initial_lr"] * lrm
+            if group['kind'] == 'muon':
+                group["momentum"] = muon_momentum
+        optimizer.step()
+    else:
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["lr"] = group["initial_lr"] * lrm
+        for group in muon_optimizer.param_groups:
+            group["momentum"] = muon_momentum
+        for opt in optimizers:
+            opt.step()
     model.zero_grad(set_to_none=True)
     synchronize()
     t1 = time.time()
@@ -276,7 +350,7 @@ while True:
     step += 1
 
     # logging
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss
+    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
     pct_done = 100 * progress
     tok_per_sec = int(args.total_batch_size / dt)
@@ -285,8 +359,8 @@ while True:
     mfu = 100 * flops_per_sec / promised_flops_per_sec_h100 # in %
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
-    print0(f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
-    if step % 10 == 0:
+    print0(f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time (s): {total_training_time:.6f}")
+    if step % max(1, 10 // LOG_FACTOR) == 0:
         wandb_run.log({
             "step": step,
             "total_training_flops": flops_so_far,
@@ -306,7 +380,7 @@ print0(f"Minimum validation bpb: {min_val_bpb:.4f}")
 # Log to report
 if not args.dry_run:
     from nanochat.report import get_report
-    get_report().log(section="Midtraining", data=[
+    get_report(args.report_name).log(section="Midtraining", data=[
         user_config, # CLI args
         { # stats about the training setup
             "Number of iterations": step,

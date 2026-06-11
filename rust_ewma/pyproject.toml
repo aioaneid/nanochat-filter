@@ -1,0 +1,44 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0", "torch>=2.9.1"]
+build-backend = "maturin"
+
+[project]
+name = "rust_ewma"
+version = "0.1.1"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.2.6",
+    "setuptools>=80.9.0",
+    "torch>=2.9.1",
+]
+
+[tool.maturin]
+# This is crucial: it tells maturin which features to enable during the build
+features = ["python", "metal"]
+# Ensure the module name matches your Rust lib name
+module-name = "rust_ewma"
+
+[project.optional-dependencies]
+
+# NVIDIA CUDA (never resolves on macOS)
+gpu = []
+
+# Apple Silicon (MPS)
+mps = []
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "cpu" },
+        { extra = "gpu" },
+        { extra = "mps" },
+    ],
+]
+
+[dependency-groups]
+dev = [
+    "maturin>=1.11.5",
+]
+
+# [tool.uv.extra-build-dependencies]
+# rust-ewma = ["maturin"]
