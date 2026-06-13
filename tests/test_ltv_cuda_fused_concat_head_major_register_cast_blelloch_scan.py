@@ -181,8 +181,42 @@ def make_logit_bias(settings, da, r):
     logit_bias = torch.empty((total_h, da), dtype=torch.float32)
     for h_glob in range(total_h):
         for da_idx in range(da):
-            logit_bias[h_glob, da_idx] = ((h_glob + 2 * da_idx) % 3) - 1
+            if settings.sigmoid:
+                # Normal behavior for sigmoid tests
+                logit_bias[h_glob, da_idx] = ((h_glob + 2 * da_idx) % 3) - 1
+            else:
+                # Force 0 to prevent exponential blowup in exact-integer tests
+                logit_bias[h_glob, da_idx] = 0
     return logit_bias
+
+
+class QuantizedStateUpdate(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, state, x_val, alpha, combined_dtype):
+        # 1. Exact float32 forward update (Matches CUDA running_x)
+        next_state = (1.0 - alpha) * state + alpha * x_val
+
+        # 2. Save the quantized state for the backward pass (Matches CUDA ptr_h)
+        state_quant = state.to(combined_dtype).to(torch.float32)
+        ctx.save_for_backward(state_quant, x_val, alpha)
+
+        return next_state
+
+    @staticmethod
+    def backward(ctx, grad_next_state):
+        state_quant, x_val, alpha = ctx.saved_tensors
+
+        # d(next_state) / d(state)
+        grad_state = grad_next_state * (1.0 - alpha)
+
+        # d(next_state) / d(x_val)
+        grad_x_val = grad_next_state * alpha
+
+        # d(next_state) / d(alpha)
+        # Here we use the quantized state, exactly mirroring: d_alpha = (x_val - h_prev_val) * g
+        grad_alpha = grad_next_state * (x_val - state_quant)
+
+        return grad_state, grad_x_val, grad_alpha, None
 
 
 def reference_forward(settings, combined, inits, logit_bias, seq_len, da, r):
@@ -220,7 +254,13 @@ def reference_forward(settings, combined, inits, logit_bias, seq_len, da, r):
                 if settings.sigmoid:
                     alpha = torch.sigmoid(alpha)
                 alpha = alpha.repeat_interleave(r)
-                state = (1.0 - alpha) * state + alpha * x_val
+
+                state = (
+                    QuantizedStateUpdate.apply(state, x_val, alpha, combined.dtype)
+                    if CUDA_SUPPORTS_NATIVE_BF16
+                    else (1.0 - alpha) * state + alpha * x_val
+                )
+
                 time_steps.append(state)
 
             heads.append(torch.stack(time_steps, dim=0))
@@ -256,12 +296,14 @@ def reference_forward(settings, combined, inits, logit_bias, seq_len, da, r):
     )
 
 
-def assert_equal(settings, actual, expected, label, case, r=1):
-    atol = 0.01 if settings.sigmoid else 0
-    rtol = 0.01 if settings.sigmoid else 0
-
+def assert_equal_with_tolerances(
+    settings, actual, expected, label, case, atol: float, rtol: float
+):
     actual_np = actual.cpu().contiguous().to(dtype=torch.float32).numpy()
     expected_np = expected.contiguous().to(dtype=torch.float32).numpy()
+
+    # print(label, case, "actual_np:", actual_np, flush=True)
+    # print(label, case, "expected_np:", expected_np, flush=True)
 
     try:
         np.testing.assert_allclose(actual_np, expected_np, rtol=rtol, atol=atol)
@@ -288,6 +330,14 @@ def assert_equal(settings, actual, expected, label, case, r=1):
                 idx = tuple(m[i] for m in mismatches)
                 print(f"  {idx}: actual={actual_np[idx]}, expected={expected_np[idx]}")
         raise e
+
+
+def assert_equal(settings, actual, expected, label, case):
+    atol = 0.01 if settings.sigmoid else 0
+    rtol = 0.01 if settings.sigmoid else 0
+    assert_equal_with_tolerances(
+        settings, actual, expected, label, case, atol=atol, rtol=rtol
+    )
 
 
 def test_forward_exact(
@@ -318,7 +368,13 @@ def test_forward_exact(
             expected_q, expected_k, expected_v = None, None, None
             if settings.check_against_expected:
                 expected_q, expected_k, expected_v = reference_forward(
-                    settings, combined_cpu, inits_cpu, logit_bias_cpu, seq_len, da, r
+                    settings,
+                    combined_cpu,
+                    inits_cpu,
+                    logit_bias_cpu,
+                    seq_len,
+                    da,
+                    r,
                 )
 
             combined_cuda = torch.as_strided(
@@ -497,7 +553,6 @@ def test_backward_exact(
                         expected_grad_combined,
                         "grad_combined",
                         case,
-                        r=r,
                     )
                     assert_equal(
                         settings,
@@ -505,7 +560,6 @@ def test_backward_exact(
                         expected_grad_inits,
                         "grad_inits",
                         case,
-                        r=r,
                     )
                     assert_equal(
                         settings,
@@ -513,7 +567,6 @@ def test_backward_exact(
                         expected_grad_logit_bias,
                         "grad_logit_bias",
                         case,
-                        r=r,
                     )
 
             if settings.benchmark:
