@@ -157,15 +157,20 @@
     for (int t_chunk = 0; t_chunk < full_t_chunks; ++t_chunk)                       \
     {                                                                               \
       /* ---- One warp computes alpha for the whole chunk ---- */                   \
+      T_compute alpha;                                                              \
       if (lane_y == 0)                                                              \
       {                                                                             \
         T_compute l_raw = (T_compute)combined[logit_idx_t];                         \
         l_raw += bias_val;                                                          \
-        alpha_cache[lane_x] = UseSigmoid ? sigmoid_f32(l_raw) : l_raw;              \
+        alpha = UseSigmoid ? sigmoid_f32(l_raw) : l_raw;                            \
+        alpha_cache[lane_x] = alpha;                                                \
       }                                                                             \
       __syncthreads();                                                              \
+      if (lane_y != 0)                                                              \
+      {                                                                             \
+        alpha = alpha_cache[lane_x];                                                \
+      }                                                                             \
                                                                                     \
-      T_compute alpha = alpha_cache[lane_x];                                        \
       AffineState<T_compute, kRItems> thread_input;                                 \
       thread_input.a = T_compute(1) - alpha;                                        \
                                                                                     \
@@ -220,22 +225,28 @@
       bool valid_t = (t_global < T_seq);                                            \
                                                                                     \
       /* ---- One warp computes alpha (or writes 0 for invalid lanes) ---- */       \
+      T_compute alpha;                                                              \
       if (lane_y == 0)                                                              \
       {                                                                             \
         if (valid_t)                                                                \
         {                                                                           \
           T_compute l_raw = (T_compute)combined[logit_idx_t];                       \
           l_raw += bias_val;                                                        \
-          alpha_cache[lane_x] = UseSigmoid ? sigmoid_f32(l_raw) : l_raw;            \
+          alpha = UseSigmoid ? sigmoid_f32(l_raw) : l_raw;                          \
+          alpha_cache[lane_x] = alpha;                                              \
         }                                                                           \
         else                                                                        \
         {                                                                           \
-          alpha_cache[lane_x] = T_compute(0);                                       \
+          alpha = T_compute(0);                                                     \
+          alpha_cache[lane_x] = alpha;                                              \
         }                                                                           \
       }                                                                             \
       __syncthreads();                                                              \
+      if (lane_y != 0)                                                              \
+      {                                                                             \
+        alpha = alpha_cache[lane_x];                                                \
+      }                                                                             \
                                                                                     \
-      T_compute alpha = alpha_cache[lane_x];                                        \
       AffineState<T_compute, kRItems> thread_input;                                 \
                                                                                     \
       if (valid_t)                                                                  \

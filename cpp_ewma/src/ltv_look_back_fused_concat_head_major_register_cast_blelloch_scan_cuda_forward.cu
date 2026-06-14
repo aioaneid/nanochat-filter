@@ -1,5 +1,7 @@
 #include "ltv_fused_concat_head_major_register_cast_blelloch_scan_cuda_common.cuh"
 
+#include "ltv_look_back_fused_concat_head_major_register_cast_scan_cuda_common.cuh"
+
 // -------------------------------------------------------------------------
 // Macro that expands to the full look‑back forward device function body.
 // Parameters:
@@ -24,6 +26,8 @@
         using ScanTemp = typename cub::WarpScan<AffineState<T_compute, kRItems>,                                \
                                                 kScanThreads>::TempStorage;                                     \
         __shared__ alignas(16) ScanTemp scan_temp[kRThreads];                                                   \
+        /* Cache for sigmoid/alpha values – one per time step in the chunk */                                   \
+        __shared__ T_compute alpha_cache[kScanThreads];                                                         \
                                                                                                                 \
         const unsigned int b_idx = blockIdx.x;                                                                  \
         const unsigned int h_glob = blockIdx.y;                                                                 \
@@ -126,9 +130,20 @@
         {                                                                                                       \
             bool valid_t = (t_global >= t_start) && (t_global < t_end);                                         \
                                                                                                                 \
-            T_compute l_raw = (T_compute)combined[logit_idx_t];                                                 \
-            l_raw += bias_val;                                                                                  \
-            T_compute alpha = UseSigmoid ? sigmoid_f32(l_raw) : l_raw;                                          \
+            /* ---- One warp computes alpha for the whole chunk ---- */                                         \
+            T_compute alpha;                                                                                    \
+            if (lane_y == 0)                                                                                    \
+            {                                                                                                   \
+                T_compute l_raw = (T_compute)combined[logit_idx_t];                                             \
+                l_raw += bias_val;                                                                              \
+                alpha = UseSigmoid ? sigmoid_f32(l_raw) : l_raw;                                                \
+                alpha_cache[lane_x] = alpha;                                                                    \
+            }                                                                                                   \
+            __syncthreads();                                                                                    \
+            if (lane_y != 0)                                                                                    \
+            {                                                                                                   \
+                alpha = alpha_cache[lane_x];                                                                    \
+            }                                                                                                   \
                                                                                                                 \
             AffineState<T_compute, kRItems> thread_input;                                                       \
             thread_input.a = T_compute(1) - alpha;                                                              \
@@ -175,14 +190,33 @@
             bool valid_read = (t_global < t_end);                                                               \
             bool valid_write = (t_global >= t_start) && (t_global < t_end);                                     \
                                                                                                                 \
+            /* ---- One warp computes alpha (or writes 0 for invalid lanes) ---- */                             \
+            T_compute alpha;                                                                                    \
+            if (lane_y == 0)                                                                                    \
+            {                                                                                                   \
+                if (valid_read)                                                                                 \
+                {                                                                                               \
+                    T_compute l_raw = (T_compute)combined[logit_idx_t];                                         \
+                    l_raw += bias_val;                                                                          \
+                    alpha = UseSigmoid ? sigmoid_f32(l_raw) : l_raw;                                            \
+                    alpha_cache[lane_x] = alpha;                                                                \
+                }                                                                                               \
+                else                                                                                            \
+                {                                                                                               \
+                    alpha = T_compute(0);                                                                       \
+                    alpha_cache[lane_x] = alpha;                                                                \
+                }                                                                                               \
+            }                                                                                                   \
+            __syncthreads();                                                                                    \
+            if (lane_y != 0)                                                                                    \
+            {                                                                                                   \
+                alpha = alpha_cache[lane_x];                                                                    \
+            }                                                                                                   \
+                                                                                                                \
             AffineState<T_compute, kRItems> thread_input;                                                       \
-            T_compute alpha = T_compute(0);                                                                     \
                                                                                                                 \
             if (valid_read)                                                                                     \
             {                                                                                                   \
-                T_compute l_raw = (T_compute)combined[logit_idx_t];                                             \
-                l_raw += bias_val;                                                                              \
-                alpha = UseSigmoid ? sigmoid_f32(l_raw) : l_raw;                                                \
                 thread_input.a = T_compute(1) - alpha;                                                          \
             }                                                                                                   \
             else                                                                                                \
@@ -416,8 +450,7 @@ void ltv_look_back_forward_dispatch(
         return;                                                                                                                     \
     }
 
-    LAUNCH_IF(2147483647, 1, 1, true);
-    LAUNCH_IF(16, 16, 9, true);
+    LTV_LOOK_BACK_LAUNCH_EACH_PQK();
 
     TORCH_CHECK(false, "ltv_look_back_forward: unsupported dispatch configuration. "
                        "P=",

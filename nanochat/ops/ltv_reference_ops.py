@@ -1,6 +1,39 @@
 import torch
 
 
+# ---------------------------------------------------------------------------
+# Quantized state update – matches CUDA kernel's bfloat16 handling
+# ---------------------------------------------------------------------------
+class QuantizedStateUpdate(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, state, x_val, alpha, combined_dtype):
+        # 1. Exact float32 forward update (matches CUDA running_x)
+        next_state = (1.0 - alpha) * state + alpha * x_val
+
+        # 2. Save the quantized state for the backward pass (matches CUDA ptr_h)
+        state_quant = state.to(combined_dtype).to(torch.float32)
+        ctx.save_for_backward(state_quant, x_val, alpha)
+
+        return next_state
+
+    @staticmethod
+    def backward(ctx, grad_next_state):
+        state_quant, x_val, alpha = ctx.saved_tensors
+
+        # d(next_state) / d(state)
+        grad_state = grad_next_state * (1.0 - alpha)
+
+        # d(next_state) / d(x_val)
+        grad_x_val = grad_next_state * alpha
+
+        # d(next_state) / d(alpha)
+        # Uses the quantized state, exactly mirroring:
+        #   d_alpha = (x_val - h_prev_val) * g
+        grad_alpha = grad_next_state * (x_val - state_quant)
+
+        return grad_state, grad_x_val, grad_alpha, None
+
+
 def ltv_look_back_fused_concat_head_major_register_cast_sequential_scan_minimal(
     combined: torch.Tensor,  # (B, T, F) with F = total_h * (D + da)
     inits: torch.Tensor,  # (B, total_h, D)
@@ -16,7 +49,7 @@ def ltv_look_back_fused_concat_head_major_register_cast_sequential_scan_minimal(
 ):
     """
     Pure-Python reference for the chunked sequential scan.
-    combined has shape (B, T, F) - exactly the layout used by the sequential
+    combined has shape (B, T, F) – exactly the layout used by the sequential
     CUDA kernel and also the layout produced by the Blelloch filter's _project.
     Returns:
         out_q : (B, NH, T, D)
@@ -79,7 +112,11 @@ def ltv_look_back_fused_concat_head_major_register_cast_sequential_scan_minimal(
                     )
                     alpha = torch.sigmoid(alpha_raw) if use_sigmoid else alpha_raw
                     alpha_bc = alpha.repeat_interleave(r)  # broadcast to D
-                    state = (1.0 - alpha_bc) * state + alpha_bc * x_val
+
+                    # Use quantized update to match CUDA kernel's bfloat16 behaviour
+                    state = QuantizedStateUpdate.apply(
+                        state, x_val, alpha_bc, combined.dtype
+                    )
 
                     if t >= t_start:
                         out_buf[h_loc, t] = state.to(dtype=combined.dtype)
@@ -119,6 +156,39 @@ def ltv_look_back_fused_concat_head_major_register_cast_blelloch_scan_minimal(
         Q,
         K,
         use_sigmoid,
+    )
+
+
+def ltv_fused_concat_head_major_register_cast_blelloch_scan_minimal(
+    combined: torch.Tensor,  # (B, T, F)
+    inits: torch.Tensor,
+    logit_bias: torch.Tensor,
+    NH: int,
+    NKVH: int,
+    Da: int,
+    r: int,
+    P: int = 2147483647,
+    Q: int = 1,
+    K: int = 1,
+    use_sigmoid: bool = False,
+):
+    """
+    Minimal reference for the fused-concat Blelloch scan.
+    This is equivalent to the sequential scan with no chunking / look-back,
+    i.e. P=2_147_483_647, Q=1, K=1.
+    """
+    return ltv_look_back_fused_concat_head_major_register_cast_sequential_scan_minimal(
+        combined,
+        inits,
+        logit_bias,
+        NH,
+        NKVH,
+        Da,
+        r,
+        P=2147483647,
+        Q=1,
+        K=1,
+        use_sigmoid=use_sigmoid,
     )
 
 
@@ -191,6 +261,37 @@ def ltv_look_back_blelloch_scan_reference(
         P,
         Q,
         K,
+        use_sigmoid,
+    )
+
+
+def ltv_fused_concat_head_major_register_cast_blelloch_scan_reference(
+    combined: torch.Tensor,
+    inits: torch.Tensor,
+    logit_bias: torch.Tensor,
+    NH: int,
+    NKVH: int,
+    Da: int,
+    r: int,
+    scan_threads_forward: int,
+    r_threads_forward: int,
+    r_items_forward: int,
+    scan_threads_backward: int,
+    r_threads_backward: int,
+    r_items_backward: int,
+    use_sigmoid: bool,
+):
+    return ltv_fused_concat_head_major_register_cast_blelloch_scan_minimal(
+        combined,
+        inits,
+        logit_bias,
+        NH,
+        NKVH,
+        Da,
+        r,
+        2147483647,
+        1,
+        1,
         use_sigmoid,
     )
 

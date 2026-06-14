@@ -2,6 +2,8 @@
 
 #include "ltv_fused_concat_head_major_register_cast_sequential_scan_cuda_common.cuh"
 
+#include "ltv_look_back_fused_concat_head_major_register_cast_scan_cuda_common.cuh"
+
 // -------------------------------------------------------------------------
 // Macro that expands to the full sequential‑scan backward device function body.
 // Parameters:
@@ -103,6 +105,8 @@
     const T_compute bias = logit_bias[h_glob * Da + da_idx];                                                            \
                                                                                                                         \
     __shared__ typename cub::BlockReduce<T_compute, kRThreads>::TempStorage temp_storage;                               \
+    __shared__ T_compute shm_alpha;                                                                                     \
+    __shared__ T_compute shm_d_l_multiplier;                                                                            \
     T_compute bias_sum_local = T_compute(0);                                                                            \
                                                                                                                         \
     int t_len = (t_chunk == 0) ? P : Q;                                                                                 \
@@ -139,29 +143,52 @@
     /* Phase 1: Suffix */                                                                                               \
     for (int t = t_suf_end - 1; t >= t_end; --t)                                                                        \
     {                                                                                                                   \
-      T_compute logit = (T_compute)combined[logit_in_base + (int64_t)t * sc_in_t] + bias;                               \
-      T_compute alpha = UseSigmoid ? sigmoid_f32(logit) : logit;                                                        \
+      T_compute alpha;                                                                                                  \
+      if (tid == 0)                                                                                                     \
+      {                                                                                                                 \
+        T_compute logit = (T_compute)combined[logit_in_base + (int64_t)t * sc_in_t] + bias;                             \
+        alpha = UseSigmoid ? sigmoid_f32(logit) : logit;                                                                \
+        shm_alpha = alpha;                                                                                              \
+      }                                                                                                                 \
+      __syncthreads();                                                                                                  \
+      if (tid != 0)                                                                                                     \
+      {                                                                                                                 \
+        alpha = shm_alpha;                                                                                              \
+      }                                                                                                                 \
       T_compute one_minus_alpha = T_compute(1) - alpha;                                                                 \
       _Pragma("unroll") for (int i = 0; i < kRItems; ++i) if (valid_r[i]) running_grad[i] *= one_minus_alpha;           \
+      __syncthreads();                                                                                                  \
     }                                                                                                                   \
                                                                                                                         \
     /* Phase 2: Main Body */                                                                                            \
     int main_end = (t_chunk == 0) ? 1 : t_start;                                                                        \
     for (int t = t_end - 1; t >= main_end; --t)                                                                         \
     {                                                                                                                   \
-      T_compute logit = (T_compute)combined[logit_in_base + (int64_t)t * sc_in_t] + bias;                               \
       T_compute alpha, d_l_multiplier;                                                                                  \
-      if constexpr (UseSigmoid)                                                                                         \
+      if (tid == 0)                                                                                                     \
       {                                                                                                                 \
-        T_compute sig = sigmoid_f32(logit);                                                                             \
-        alpha = sig;                                                                                                    \
-        d_l_multiplier = sig * (T_compute(1) - sig);                                                                    \
+        T_compute logit = (T_compute)combined[logit_in_base + (int64_t)t * sc_in_t] + bias;                             \
+        if constexpr (UseSigmoid)                                                                                       \
+        {                                                                                                               \
+          T_compute sig = sigmoid_f32(logit);                                                                           \
+          alpha = sig;                                                                                                  \
+          d_l_multiplier = sig * (T_compute(1) - sig);                                                                  \
+        }                                                                                                               \
+        else                                                                                                            \
+        {                                                                                                               \
+          alpha = logit;                                                                                                \
+          d_l_multiplier = T_compute(1);                                                                                \
+        }                                                                                                               \
+        shm_alpha = alpha;                                                                                              \
+        shm_d_l_multiplier = d_l_multiplier;                                                                            \
       }                                                                                                                 \
-      else                                                                                                              \
+      __syncthreads();                                                                                                  \
+      if (tid != 0)                                                                                                     \
       {                                                                                                                 \
-        alpha = logit;                                                                                                  \
-        d_l_multiplier = T_compute(1);                                                                                  \
+        alpha = shm_alpha;                                                                                              \
+        d_l_multiplier = shm_d_l_multiplier;                                                                            \
       }                                                                                                                 \
+                                                                                                                        \
       T_compute one_minus_alpha = T_compute(1) - alpha;                                                                 \
       T_compute thread_logit_grad = T_compute(0);                                                                       \
                                                                                                                         \
@@ -198,19 +225,31 @@
     if (t_chunk == 0 && t_end > 0)                                                                                      \
     {                                                                                                                   \
       int t = 0;                                                                                                        \
-      T_compute logit = (T_compute)combined[logit_in_base + (int64_t)t * sc_in_t] + bias;                               \
       T_compute alpha, d_l_multiplier;                                                                                  \
-      if constexpr (UseSigmoid)                                                                                         \
+      if (tid == 0)                                                                                                     \
       {                                                                                                                 \
-        T_compute sig = sigmoid_f32(logit);                                                                             \
-        alpha = sig;                                                                                                    \
-        d_l_multiplier = sig * (T_compute(1) - sig);                                                                    \
+        T_compute logit = (T_compute)combined[logit_in_base + (int64_t)t * sc_in_t] + bias;                             \
+        if constexpr (UseSigmoid)                                                                                       \
+        {                                                                                                               \
+          T_compute sig = sigmoid_f32(logit);                                                                           \
+          alpha = sig;                                                                                                  \
+          d_l_multiplier = sig * (T_compute(1) - sig);                                                                  \
+        }                                                                                                               \
+        else                                                                                                            \
+        {                                                                                                               \
+          alpha = logit;                                                                                                \
+          d_l_multiplier = T_compute(1);                                                                                \
+        }                                                                                                               \
+        shm_alpha = alpha;                                                                                              \
+        shm_d_l_multiplier = d_l_multiplier;                                                                            \
       }                                                                                                                 \
-      else                                                                                                              \
+      __syncthreads();                                                                                                  \
+      if (tid != 0)                                                                                                     \
       {                                                                                                                 \
-        alpha = logit;                                                                                                  \
-        d_l_multiplier = T_compute(1);                                                                                  \
+        alpha = shm_alpha;                                                                                              \
+        d_l_multiplier = shm_d_l_multiplier;                                                                            \
       }                                                                                                                 \
+                                                                                                                        \
       T_compute one_minus_alpha = T_compute(1) - alpha;                                                                 \
       T_compute thread_logit_grad = T_compute(0);                                                                       \
                                                                                                                         \
@@ -239,15 +278,27 @@
         atomicAdd(&grad_logit_accum[accum_idx], total_logit_grad);                                                      \
         bias_sum_local += total_logit_grad;                                                                             \
       }                                                                                                                 \
+      __syncthreads();                                                                                                  \
     }                                                                                                                   \
                                                                                                                         \
     /* Phase 4: Prefix */                                                                                               \
     for (int t = t_start - 1; t >= t_pref_start; --t)                                                                   \
     {                                                                                                                   \
-      T_compute logit = (T_compute)combined[logit_in_base + (int64_t)t * sc_in_t] + bias;                               \
-      T_compute alpha = UseSigmoid ? sigmoid_f32(logit) : logit;                                                        \
+      T_compute alpha;                                                                                                  \
+      if (tid == 0)                                                                                                     \
+      {                                                                                                                 \
+        T_compute logit = (T_compute)combined[logit_in_base + (int64_t)t * sc_in_t] + bias;                             \
+        alpha = UseSigmoid ? sigmoid_f32(logit) : logit;                                                                \
+        shm_alpha = alpha;                                                                                              \
+      }                                                                                                                 \
+      __syncthreads();                                                                                                  \
+      if (tid != 0)                                                                                                     \
+      {                                                                                                                 \
+        alpha = shm_alpha;                                                                                              \
+      }                                                                                                                 \
       T_compute one_minus_alpha = T_compute(1) - alpha;                                                                 \
       _Pragma("unroll") for (int i = 0; i < kRItems; ++i) if (valid_r[i]) running_grad[i] *= one_minus_alpha;           \
+      __syncthreads();                                                                                                  \
     }                                                                                                                   \
                                                                                                                         \
     /* Inits Accumulation */                                                                                            \
@@ -441,12 +492,12 @@ __global__ void ltv_look_back_fused_concat_sequential_scan_backward_kernel_const
 }
 
 // -------------------------------------------------------------------------
-// Shared memory size and validity helpers (unchanged)
+// Shared memory size and validity helpers
 // -------------------------------------------------------------------------
 template <typename T_compute, int kRThreads>
 constexpr size_t backward_shared_memory_bytes()
 {
-  return sizeof(typename cub::BlockReduce<T_compute, kRThreads>::TempStorage);
+  return sizeof(typename cub::BlockReduce<T_compute, kRThreads>::TempStorage) + 2 * sizeof(T_compute);
 }
 
 template <int kRThreads>
@@ -695,8 +746,7 @@ void ltv_look_back_backward_dispatch(
     return;                                                         \
   }
 
-  LAUNCH_IF(2147483647, 1, 1, true);
-  LAUNCH_IF(16, 16, 9, true);
+  LTV_LOOK_BACK_LAUNCH_EACH_PQK();
 
   TORCH_CHECK(false, "ltv_look_back_backward: unsupported dispatch configuration. "
                      " P=",

@@ -25,9 +25,7 @@ def pytest_generate_tests(metafunc):
     add_common_parametrization(metafunc, include_scan_threads=False)
 
 
-def reference_forward(
-    settings, combined, inits, logit_bias, seq_len, da, r, P, Q, K, use_sigmoid
-):
+def reference_forward(settings, combined, inits, logit_bias, seq_len, da, r, P, Q, K):
     """
     combined: (B, T, F) - the native layout for the sequential scan.
     The reference expects exactly this shape, no transposition needed.
@@ -43,7 +41,7 @@ def reference_forward(
         P,
         Q,
         K,
-        use_sigmoid,
+        settings.sigmoid,
     )
 
 
@@ -57,7 +55,7 @@ def test_forward_exact(
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
-    P, Q, K, use_sigmoid = pqk_config
+    P, Q, K = pqk_config
     device = torch.device("cuda")
 
     for r in settings.r_values:
@@ -90,7 +88,6 @@ def test_forward_exact(
                     P,
                     Q,
                     K,
-                    use_sigmoid,
                 )
 
             combined_cuda = torch.as_strided(
@@ -121,7 +118,7 @@ def test_forward_exact(
                             r_items_forward,
                             0,
                             0,
-                            use_sigmoid,
+                            settings.sigmoid,
                         )
                     )
 
@@ -135,9 +132,9 @@ def test_forward_exact(
                     f"rf={r_threads_forward}, rif={r_items_forward}"
                 )
                 if settings.check_against_expected:
-                    assert_equal(actual_q, expected_q, "q", case, use_sigmoid)
-                    assert_equal(actual_k, expected_k, "k", case, use_sigmoid)
-                    assert_equal(actual_v, expected_v, "v", case, use_sigmoid)
+                    assert_equal(actual_q, expected_q, "q", case, settings.sigmoid)
+                    assert_equal(actual_k, expected_k, "k", case, settings.sigmoid)
+                    assert_equal(actual_v, expected_v, "v", case, settings.sigmoid)
 
             if settings.benchmark:
                 logger.info(f"Case Forward: {case} time_ns: {end - start:_}")
@@ -155,7 +152,7 @@ def test_backward_exact(
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
-    P, Q, K, use_sigmoid = pqk_config
+    P, Q, K = pqk_config
     device = torch.device("cuda")
 
     for r in settings.r_values:
@@ -193,7 +190,7 @@ def test_backward_exact(
                         P,
                         Q,
                         K,
-                        use_sigmoid,
+                        settings.sigmoid,
                     )
                 )
                 grad_q = torch.ones_like(expected_q)
@@ -246,7 +243,7 @@ def test_backward_exact(
                         r_items_forward,
                         r_threads_backward,
                         r_items_backward,
-                        use_sigmoid,
+                        settings.sigmoid,
                     )
                 )
                 torch.autograd.backward(
@@ -271,21 +268,21 @@ def test_backward_exact(
                         expected_grad_combined,
                         "grad_combined",
                         case,
-                        use_sigmoid,
+                        settings.sigmoid,
                     )
                     assert_equal(
                         inits_cuda.grad,
                         expected_grad_inits,
                         "grad_inits",
                         case,
-                        use_sigmoid,
+                        settings.sigmoid,
                     )
                     assert_equal(
                         logit_bias_cuda.grad,
                         expected_grad_logit_bias,
                         "grad_logit_bias",
                         case,
-                        use_sigmoid,
+                        settings.sigmoid,
                     )
 
             if settings.benchmark:

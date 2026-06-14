@@ -1,4 +1,5 @@
 #include "ltv_fused_concat_head_major_register_cast_sequential_scan_cuda_common.cuh"
+#include "ltv_look_back_fused_concat_head_major_register_cast_scan_cuda_common.cuh"
 
 // -------------------------------------------------------------------------
 // Macro that expands to the full sequential‑scan forward device function body.
@@ -63,6 +64,8 @@
                                                                                                                          \
         const T_compute bias_val = logit_bias[h_glob * Da + da_idx];                                                     \
                                                                                                                          \
+        __shared__ T_compute shm_alpha;                                                                                  \
+                                                                                                                         \
         const int r_start = tid * kRItems + r_chunk * r_stride;                                                          \
         bool valid_r[kRItems];                                                                                           \
         _Pragma("unroll") for (int i = 0; i < kRItems; ++i)                                                              \
@@ -102,8 +105,19 @@
         /* Phase 1: Preface loop (t < t_start) */                                                                        \
         for (int t = t_pref_start; t < t_start; ++t)                                                                     \
         {                                                                                                                \
-            T_compute l_raw = (T_compute)combined[logit_base_idx + current_t_offset] + bias_val;                         \
-            T_compute alpha = UseSigmoid ? sigmoid_f32(l_raw) : l_raw;                                                   \
+            T_compute alpha;                                                                                             \
+            if (tid == 0)                                                                                                \
+            {                                                                                                            \
+                T_compute l_raw = (T_compute)combined[logit_base_idx + current_t_offset] + bias_val;                     \
+                alpha = UseSigmoid ? sigmoid_f32(l_raw) : l_raw;                                                         \
+                shm_alpha = alpha;                                                                                       \
+            }                                                                                                            \
+            __syncthreads();                                                                                             \
+            if (tid != 0)                                                                                                \
+            {                                                                                                            \
+                alpha = shm_alpha;                                                                                       \
+            }                                                                                                            \
+                                                                                                                         \
             T_compute one_minus_alpha = T_compute(1) - alpha;                                                            \
                                                                                                                          \
             _Pragma("unroll") for (int i = 0; i < kRItems; ++i)                                                          \
@@ -114,14 +128,26 @@
                 running_x[i] = alpha * val + one_minus_alpha * running_x[i];                                             \
             }                                                                                                            \
             current_t_offset += sc_t;                                                                                    \
+            __syncthreads();                                                                                             \
         }                                                                                                                \
                                                                                                                          \
         /* Phase 2: Main loop (t >= t_start) */                                                                          \
         int64_t current_out_offset = out_base;                                                                           \
         for (int t = t_start; t < t_end; ++t)                                                                            \
         {                                                                                                                \
-            T_compute l_raw = (T_compute)combined[logit_base_idx + current_t_offset] + bias_val;                         \
-            T_compute alpha = UseSigmoid ? sigmoid_f32(l_raw) : l_raw;                                                   \
+            T_compute alpha;                                                                                             \
+            if (tid == 0)                                                                                                \
+            {                                                                                                            \
+                T_compute l_raw = (T_compute)combined[logit_base_idx + current_t_offset] + bias_val;                     \
+                alpha = UseSigmoid ? sigmoid_f32(l_raw) : l_raw;                                                         \
+                shm_alpha = alpha;                                                                                       \
+            }                                                                                                            \
+            __syncthreads();                                                                                             \
+            if (tid != 0)                                                                                                \
+            {                                                                                                            \
+                alpha = shm_alpha;                                                                                       \
+            }                                                                                                            \
+                                                                                                                         \
             T_compute one_minus_alpha = T_compute(1) - alpha;                                                            \
                                                                                                                          \
             _Pragma("unroll") for (int i = 0; i < kRItems; ++i)                                                          \
@@ -135,6 +161,7 @@
             }                                                                                                            \
             current_t_offset += sc_t;                                                                                    \
             current_out_offset += out_stride_t;                                                                          \
+            __syncthreads();                                                                                             \
         }                                                                                                                \
     } while (0)
 
@@ -322,8 +349,7 @@ void ltv_look_back_forward_dispatch(
         return;                                                       \
     }
 
-    LAUNCH_IF(2147483647, 1, 1, true);
-    LAUNCH_IF(16, 16, 9, true);
+    LTV_LOOK_BACK_LAUNCH_EACH_PQK();
 
     TORCH_CHECK(false, "ltv_look_back_forward: unsupported dispatch configuration. "
                        "P=",

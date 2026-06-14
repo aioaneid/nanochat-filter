@@ -24,6 +24,7 @@ class Settings:
         self,
         benchmark: bool,
         check_against_expected: bool,
+        sigmoid: bool,
         batch: int = 4,
         nh: int = 8,
         nkvh: int = 8,
@@ -32,6 +33,7 @@ class Settings:
     ):
         self.benchmark = benchmark
         self.check_against_expected = check_against_expected
+        self.sigmoid = sigmoid
         self.batch = batch
         self.nh = nh
         self.nkvh = nkvh
@@ -50,7 +52,8 @@ def settings(pytestconfig):
     check = (
         pytestconfig.getoption("--check_against_expected", "false").lower() == "true"
     )
-    return Settings(benchmark=benchmark, check_against_expected=check)
+    sigmoid = pytestconfig.getoption("--sigmoid", "false").lower() == "true"
+    return Settings(benchmark=benchmark, check_against_expected=check, sigmoid=sigmoid)
 
 
 def get_standard_stride_layout(shape):
@@ -119,7 +122,12 @@ def make_logit_bias(settings, da, r):
     logit_bias = torch.empty((total_h, da), dtype=torch.float32)
     for h_glob in range(total_h):
         for da_idx in range(da):
-            logit_bias[h_glob, da_idx] = ((h_glob + 2 * da_idx) % 3) - 1
+            if settings.sigmoid:
+                # Normal behavior for sigmoid tests
+                logit_bias[h_glob, da_idx] = ((h_glob + 2 * da_idx) % 3) - 1
+            else:
+                # Force 0 to prevent exponential blowup in exact-integer tests
+                logit_bias[h_glob, da_idx] = 0
     return logit_bias
 
 
@@ -180,6 +188,4 @@ def add_common_parametrization(metafunc, include_scan_threads=True):
         metafunc.parametrize("r_items_backward", [1, 4])
 
     if "pqk_config" in metafunc.fixturenames:
-        use_sigmoid = metafunc.config.getoption("--sigmoid", "false").lower() == "true"
-        configs = [cfg + (use_sigmoid,) for cfg in SUPPORTED_PQK_CONFIGS]
-        metafunc.parametrize("pqk_config", configs)
+        metafunc.parametrize("pqk_config", SUPPORTED_PQK_CONFIGS)

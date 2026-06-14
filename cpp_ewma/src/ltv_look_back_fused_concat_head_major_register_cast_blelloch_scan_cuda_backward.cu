@@ -1,5 +1,7 @@
 #include "ltv_fused_concat_head_major_register_cast_blelloch_scan_cuda_common.cuh"
 
+#include "ltv_look_back_fused_concat_head_major_register_cast_scan_cuda_common.cuh"
+
 // -------------------------------------------------------------------------
 // Macro that expands to the full look‑back backward device function body.
 // Parameters:
@@ -11,315 +13,337 @@
 //   str_hq_b, str_hq_h, str_hq_t, str_hq_d, ... all stride arguments,
 //   T_seq, NH, NKVH, Da, r
 // -------------------------------------------------------------------------
-#define LTV_LOOK_BACK_FUSED_CONCAT_HM_BACKWARD_DEVICE_BODY(                                   \
-    T_in, T_compute, T_out, kScanThreads, kRThreads, kRItems,                                 \
-    UseSigmoid, P, Q, K,                                                                      \
-    combined, inits, logit_bias, hq, hk, hv, grad_hq, grad_hk, grad_hv,                       \
-    grad_combined, grad_inits_accum, grad_logit_bias, grad_logit_accum,                       \
-    sc_in_b, sc_in_t, sc_in_e, sc_out_b, sc_out_t, sc_out_e,                                  \
-    str_hq_b, str_hq_h, str_hq_t, str_hq_d,                                                   \
-    str_hk_b, str_hk_h, str_hk_t, str_hk_d,                                                   \
-    str_hv_b, str_hv_h, str_hv_t, str_hv_d,                                                   \
-    str_gq_b, str_gq_h, str_gq_t, str_gq_d,                                                   \
-    str_gk_b, str_gk_h, str_gk_t, str_gk_d,                                                   \
-    str_gv_b, str_gv_h, str_gv_t, str_gv_d,                                                   \
-    T_seq, NH, NKVH, Da, r)                                                                   \
-  do                                                                                          \
-  {                                                                                           \
-    const int tid = threadIdx.x;                                                              \
-    const int lane_x = tid % kScanThreads;                                                    \
-    const int lane_y = tid / kScanThreads;                                                    \
-                                                                                              \
-    using ScanTemp = typename cub::WarpScan<AffineState<T_compute, kRItems>,                  \
-                                            kScanThreads>::TempStorage;                       \
-    __shared__ union                                                                          \
-    {                                                                                         \
-      ScanTemp scan_temp[kRThreads];                                                          \
-      T_compute partial_flat[kRThreads * kScanThreads];                                       \
-    } shared_mem;                                                                             \
-    __shared__ T_compute running_x[kRThreads * kRItems];                                      \
-                                                                                              \
-    const unsigned int b_idx = blockIdx.x;                                                    \
-    const unsigned int h_glob = blockIdx.y;                                                   \
-                                                                                              \
-    const int num_r_chunks = (r + kRThreads * kRItems - 1) / (kRThreads * kRItems);           \
-    int M_dyn = (T_seq > P) ? (T_seq - P + Q - 1) / Q : 0;                                    \
-    const int num_t_chunks = 1 + M_dyn;                                                       \
-                                                                                              \
-    const int z = blockIdx.z;                                                                 \
-    const int t_chunk = z % num_t_chunks;                                                     \
-    const int rz = z / num_t_chunks;                                                          \
-    const int da_idx = rz % Da;                                                               \
-    const int r_chunk = rz / Da;                                                              \
-                                                                                              \
-    const unsigned int D = Da * r;                                                            \
-    const unsigned int total_h = NH + 2 * NKVH;                                               \
-    const unsigned int head_stride = D + Da;                                                  \
-                                                                                              \
-    const T_out *h_ptr;                                                                       \
-    const T_out *grad_h_ptr;                                                                  \
-    unsigned int h_loc;                                                                       \
-    int64_t str_h_b, str_h_h, str_h_t, str_h_d;                                               \
-    int64_t str_gh_b, str_gh_h, str_gh_t, str_gh_d;                                           \
-                                                                                              \
-    if (h_glob < NH)                                                                          \
-    {                                                                                         \
-      h_ptr = hq;                                                                             \
-      grad_h_ptr = grad_hq;                                                                   \
-      h_loc = h_glob;                                                                         \
-      str_h_b = str_hq_b;                                                                     \
-      str_h_h = str_hq_h;                                                                     \
-      str_h_t = str_hq_t;                                                                     \
-      str_h_d = str_hq_d;                                                                     \
-      str_gh_b = str_gq_b;                                                                    \
-      str_gh_h = str_gq_h;                                                                    \
-      str_gh_t = str_gq_t;                                                                    \
-      str_gh_d = str_gq_d;                                                                    \
-    }                                                                                         \
-    else if (h_glob < NH + NKVH)                                                              \
-    {                                                                                         \
-      h_ptr = hk;                                                                             \
-      grad_h_ptr = grad_hk;                                                                   \
-      h_loc = h_glob - NH;                                                                    \
-      str_h_b = str_hk_b;                                                                     \
-      str_h_h = str_hk_h;                                                                     \
-      str_h_t = str_hk_t;                                                                     \
-      str_h_d = str_hk_d;                                                                     \
-      str_gh_b = str_gk_b;                                                                    \
-      str_gh_h = str_gk_h;                                                                    \
-      str_gh_t = str_gk_t;                                                                    \
-      str_gh_d = str_gk_d;                                                                    \
-    }                                                                                         \
-    else                                                                                      \
-    {                                                                                         \
-      h_ptr = hv;                                                                             \
-      grad_h_ptr = grad_hv;                                                                   \
-      h_loc = h_glob - (NH + NKVH);                                                           \
-      str_h_b = str_hv_b;                                                                     \
-      str_h_h = str_hv_h;                                                                     \
-      str_h_t = str_hv_t;                                                                     \
-      str_h_d = str_hv_d;                                                                     \
-      str_gh_b = str_gv_b;                                                                    \
-      str_gh_h = str_gv_h;                                                                    \
-      str_gh_t = str_gv_t;                                                                    \
-      str_gh_d = str_gv_d;                                                                    \
-    }                                                                                         \
-                                                                                              \
-    const T_compute bias = logit_bias[h_glob * Da + da_idx];                                  \
-                                                                                              \
-    __shared__ T_compute block_bias_sum;                                                      \
-    if (threadIdx.x == 0)                                                                     \
-      block_bias_sum = 0.0f;                                                                  \
-    __syncthreads();                                                                          \
-                                                                                              \
-    if (r_chunk >= num_r_chunks)                                                              \
-      return;                                                                                 \
-                                                                                              \
-    const unsigned int val_base = h_glob * head_stride + da_idx * r;                          \
-    const unsigned int logit_base = h_glob * head_stride + D + da_idx;                        \
-    const int64_t b_offset_in = (int64_t)b_idx * sc_in_b;                                     \
-    const int64_t b_offset_out = (int64_t)b_idx * sc_out_b;                                   \
-                                                                                              \
-    int t_len = t_chunk ? Q : P;                                                              \
-    int t_start = P + (t_chunk - 1) * t_len;                                                  \
-    if (t_chunk && t_start >= T_seq)                                                          \
-      return;                                                                                 \
-                                                                                              \
-    int t_end = min(t_start + t_len, T_seq);                                                  \
-    int t_suf_end = min(t_end, T_seq - K) + K;                                                \
-    int t_pref_start = max(0, t_start - (K - 1));                                             \
-                                                                                              \
-    const int r_stride = kRThreads * kRItems;                                                 \
-    const int r_start = lane_y * kRItems + r_chunk * r_stride;                                \
-                                                                                              \
-    if (lane_x == 0)                                                                          \
-    {                                                                                         \
-      _Pragma("unroll") for (int i = 0; i < kRItems; ++i)                                     \
-          running_x[lane_y * kRItems + i] = T_compute(0);                                     \
-    }                                                                                         \
-    __syncthreads();                                                                          \
-                                                                                              \
-    const int64_t da_r = da_idx * r;                                                          \
-    const int64_t gh_base_invariant =                                                         \
-        (int64_t)b_idx * str_gh_b + (int64_t)h_loc * str_gh_h + da_r * str_gh_d;              \
-    const int64_t h_prev_base_invariant =                                                     \
-        (int64_t)b_idx * str_h_b + (int64_t)h_loc * str_h_h + da_r * str_h_d;                 \
-    const int64_t init_base_invariant =                                                       \
-        (int64_t)b_idx * (total_h * D) + (int64_t)h_glob * D + da_r;                          \
-    const int64_t val_in_base_invariant =                                                     \
-        b_offset_in + (int64_t)val_base * sc_in_e;                                            \
-    const int64_t val_out_base_invariant =                                                    \
-        b_offset_out + (int64_t)val_base * sc_out_e;                                          \
-    const int64_t logit_in_base_invariant =                                                   \
-        b_offset_in + (int64_t)logit_base * sc_in_e;                                          \
-                                                                                              \
-    const int partial_idx = lane_y * kScanThreads + lane_x;                                   \
-    const int64_t r_chunk_offset = r_chunk * r_stride;                                        \
-                                                                                              \
-    int t_cur = t_suf_end - 1;                                                                \
-    int t_global_first = t_cur - lane_x;                                                      \
-                                                                                              \
-    int64_t t_gh_base_lane = gh_base_invariant + t_global_first * str_gh_t;                   \
-    int64_t t_h_prev_base_lane = h_prev_base_invariant + (t_global_first - 1) * str_h_t;      \
-    int64_t t_val_in_base_lane = val_in_base_invariant + t_global_first * sc_in_t;            \
-    int64_t t_val_out_base_lane = val_out_base_invariant + t_global_first * sc_out_t;         \
-    int64_t t_logit_in_idx_lane = logit_in_base_invariant + t_global_first * sc_in_t;         \
-    int64_t t_logit_next_idx_lane = logit_in_base_invariant + (t_global_first + 1) * sc_in_t; \
-                                                                                              \
-    t_val_in_base_lane += r_chunk_offset * sc_in_e;                                           \
-    t_val_out_base_lane += r_chunk_offset * sc_out_e;                                         \
-    t_gh_base_lane += r_chunk_offset * str_gh_d;                                              \
-    t_h_prev_base_lane += r_chunk_offset * str_h_d;                                           \
-                                                                                              \
-    while (t_cur >= t_pref_start)                                                             \
-    {                                                                                         \
-      int chunk_len = min(t_cur - t_pref_start + 1, kScanThreads);                            \
-      bool valid_time = lane_x < chunk_len;                                                   \
-      int t_global = valid_time ? (t_cur - lane_x) : 0;                                       \
-                                                                                              \
-      T_compute d_l_reg = 0.0f;                                                               \
-                                                                                              \
-      T_compute a_next = T_compute(1);                                                        \
-      if (valid_time && t_global + 1 < t_suf_end)                                             \
-      {                                                                                       \
-        T_compute l_raw_next = (T_compute)combined[t_logit_next_idx_lane];                    \
-        T_compute logit_next = l_raw_next + bias;                                             \
-        T_compute alpha_next = UseSigmoid ? sigmoid_f32(logit_next) : logit_next;             \
-        a_next = T_compute(1) - alpha_next;                                                   \
-      }                                                                                       \
-                                                                                              \
-      T_compute alpha_gate = T_compute(0);                                                    \
-      T_compute a_t_gate;                                                                     \
-      T_compute d_l_multiplier;                                                               \
-      if (valid_time)                                                                         \
-      {                                                                                       \
-        T_compute l_raw = (T_compute)combined[t_logit_in_idx_lane];                           \
-        T_compute logit = l_raw + bias;                                                       \
-        alpha_gate = UseSigmoid ? sigmoid_f32(logit) : logit;                                 \
-        a_t_gate = T_compute(1) - alpha_gate;                                                 \
-        d_l_multiplier = UseSigmoid ? (alpha_gate * a_t_gate) : T_compute(1);                 \
-      }                                                                                       \
-                                                                                              \
-      AffineState<T_compute, kRItems> elem;                                                   \
-      elem.a = valid_time ? a_next : T_compute(1);                                            \
-                                                                                              \
-      int64_t item_gh_idx = t_gh_base_lane + (lane_y * kRItems) * str_gh_d;                   \
-      _Pragma("unroll") for (int item = 0; item < kRItems; ++item)                            \
-      {                                                                                       \
-        int r_idx = r_start + item;                                                           \
-        elem.x[item] = (valid_time && r_idx < r)                                              \
-                           ? (T_compute)grad_h_ptr[item_gh_idx]                               \
-                           : T_compute(0);                                                    \
-        item_gh_idx += str_gh_d;                                                              \
-      }                                                                                       \
-                                                                                              \
-      AffineState<T_compute, kRItems> scan_out;                                               \
-      cub::WarpScan<AffineState<T_compute, kRItems>, kScanThreads>(                           \
-          shared_mem.scan_temp[lane_y])                                                       \
-          .InclusiveScan(elem, scan_out, AffineScanOp<T_compute, kRItems>());                 \
-                                                                                              \
-      int64_t item_init_idx = init_base_invariant + r_start;                                  \
-      int64_t item_h_prev_idx = t_h_prev_base_lane + (lane_y * kRItems) * str_h_d;            \
-      int64_t item_val_in_idx = t_val_in_base_lane + (lane_y * kRItems) * sc_in_e;            \
-      int64_t item_val_out_idx = t_val_out_base_lane + (lane_y * kRItems) * sc_out_e;         \
-                                                                                              \
-      bool is_pref_start = (t_global == t_pref_start);                                        \
-                                                                                              \
-      for (int item = 0; item < kRItems; ++item)                                              \
-      {                                                                                       \
-        int r_idx = r_start + item;                                                           \
-        if (r_idx >= r)                                                                       \
-          break;                                                                              \
-        T_compute X_future = running_x[lane_y * kRItems + item];                              \
-        T_compute g = scan_out.a * X_future + scan_out.x[item];                               \
-                                                                                              \
-        bool valid_write = (t_global >= t_start) && (t_global < t_end);                       \
-        if (valid_time)                                                                       \
-        {                                                                                     \
-          T_compute h_prev = is_pref_start ? (T_compute)inits[item_init_idx]                  \
-                                           : (T_compute)h_ptr[item_h_prev_idx];               \
-          T_compute x_val = (T_compute)combined[item_val_in_idx];                             \
-          T_compute d_alpha = (x_val - h_prev) * g;                                           \
-          T_compute d_x = alpha_gate * g;                                                     \
-          T_compute d_l = d_alpha * d_l_multiplier;                                           \
-          if (valid_write)                                                                    \
-          {                                                                                   \
-            grad_combined[item_val_out_idx] = (T_out)d_x;                                     \
-            d_l_reg += d_l;                                                                   \
-          }                                                                                   \
-          if (is_pref_start)                                                                  \
-          {                                                                                   \
-            atomicAdd(&grad_inits_accum[item_init_idx], g * a_t_gate);                        \
-          }                                                                                   \
-        }                                                                                     \
-        if (lane_x == chunk_len - 1)                                                          \
-        {                                                                                     \
-          running_x[lane_y * kRItems + item] = g;                                             \
-        }                                                                                     \
-        item_init_idx += 1;                                                                   \
-        item_h_prev_idx += str_h_d;                                                           \
-        item_val_in_idx += sc_in_e;                                                           \
-        item_val_out_idx += sc_out_e;                                                         \
-      }                                                                                       \
-                                                                                              \
-      __syncthreads();                                                                        \
-      shared_mem.partial_flat[partial_idx] = d_l_reg;                                         \
-      __syncthreads();                                                                        \
-                                                                                              \
-      constexpr bool is_pow2 = (kRThreads > 0) && ((kRThreads & (kRThreads - 1)) == 0);       \
-      for (int stride = 1; stride < kRThreads; stride <<= 1)                                  \
-      {                                                                                       \
-        const int offset = stride * kScanThreads;                                             \
-        if ((lane_y & (2 * stride - 1)) == 0)                                                 \
-        {                                                                                     \
-          int other = lane_y + stride;                                                        \
-          if (is_pow2 || other < kRThreads)                                                   \
-          {                                                                                   \
-            shared_mem.partial_flat[partial_idx] +=                                           \
-                shared_mem.partial_flat[partial_idx + offset];                                \
-          }                                                                                   \
-        }                                                                                     \
-        __syncthreads();                                                                      \
-      }                                                                                       \
-                                                                                              \
-      if (lane_y == 0 && valid_time)                                                          \
-      {                                                                                       \
-        bool valid_write = (t_global >= t_start) && (t_global < t_end);                       \
-        if (valid_write)                                                                      \
-        {                                                                                     \
-          int64_t accum_idx = (((int64_t)b_idx * total_h + (int64_t)h_glob) * Da +            \
-                               (int64_t)da_idx) *                                             \
-                                  T_seq +                                                     \
-                              (int64_t)t_global;                                              \
-          atomicAdd(&grad_logit_accum[accum_idx], shared_mem.partial_flat[lane_x]);           \
-        }                                                                                     \
-      }                                                                                       \
-                                                                                              \
-      if (threadIdx.x == 0)                                                                   \
-      {                                                                                       \
-        for (int i = 0; i < chunk_len; ++i)                                                   \
-        {                                                                                     \
-          int t = t_cur - i;                                                                  \
-          if (t >= t_start && t < t_end)                                                      \
-            block_bias_sum += shared_mem.partial_flat[i];                                     \
-        }                                                                                     \
-      }                                                                                       \
-      __syncthreads();                                                                        \
-                                                                                              \
-      t_gh_base_lane -= kScanThreads * str_gh_t;                                              \
-      t_h_prev_base_lane -= kScanThreads * str_h_t;                                           \
-      t_val_in_base_lane -= kScanThreads * sc_in_t;                                           \
-      t_val_out_base_lane -= kScanThreads * sc_out_t;                                         \
-      t_logit_in_idx_lane -= kScanThreads * sc_in_t;                                          \
-      t_logit_next_idx_lane -= kScanThreads * sc_in_t;                                        \
-      t_cur -= kScanThreads;                                                                  \
-    }                                                                                         \
-                                                                                              \
-    if (threadIdx.x == 0)                                                                     \
-    {                                                                                         \
-      const int bias_idx = h_glob * Da + da_idx;                                              \
-      atomicAdd(&grad_logit_bias[bias_idx], block_bias_sum);                                  \
-    }                                                                                         \
+#define LTV_LOOK_BACK_FUSED_CONCAT_HM_BACKWARD_DEVICE_BODY(                                  \
+    T_in, T_compute, T_out, kScanThreads, kRThreads, kRItems,                                \
+    UseSigmoid, P, Q, K,                                                                     \
+    combined, inits, logit_bias, hq, hk, hv, grad_hq, grad_hk, grad_hv,                      \
+    grad_combined, grad_inits_accum, grad_logit_bias, grad_logit_accum,                      \
+    sc_in_b, sc_in_t, sc_in_e, sc_out_b, sc_out_t, sc_out_e,                                 \
+    str_hq_b, str_hq_h, str_hq_t, str_hq_d,                                                  \
+    str_hk_b, str_hk_h, str_hk_t, str_hk_d,                                                  \
+    str_hv_b, str_hv_h, str_hv_t, str_hv_d,                                                  \
+    str_gq_b, str_gq_h, str_gq_t, str_gq_d,                                                  \
+    str_gk_b, str_gk_h, str_gk_t, str_gk_d,                                                  \
+    str_gv_b, str_gv_h, str_gv_t, str_gv_d,                                                  \
+    T_seq, NH, NKVH, Da, r)                                                                  \
+  do                                                                                         \
+  {                                                                                          \
+    const int tid = threadIdx.x;                                                             \
+    const int lane_x = tid % kScanThreads;                                                   \
+    const int lane_y = tid / kScanThreads;                                                   \
+                                                                                             \
+    using ScanTemp = typename cub::WarpScan<AffineState<T_compute, kRItems>,                 \
+                                            kScanThreads>::TempStorage;                      \
+    __shared__ union                                                                         \
+    {                                                                                        \
+      ScanTemp scan_temp[kRThreads];                                                         \
+      T_compute partial_flat[kRThreads * kScanThreads];                                      \
+    } shared_mem;                                                                            \
+    __shared__ T_compute running_x[kRThreads * kRItems];                                     \
+    __shared__ T_compute shm_alpha_gate[kScanThreads];                                       \
+    __shared__ T_compute carry_alpha_cache;                                                  \
+                                                                                             \
+    const unsigned int shuffle_mask = __activemask();                                        \
+                                                                                             \
+    const unsigned int b_idx = blockIdx.x;                                                   \
+    const unsigned int h_glob = blockIdx.y;                                                  \
+                                                                                             \
+    const int num_r_chunks = (r + kRThreads * kRItems - 1) / (kRThreads * kRItems);          \
+    int M_dyn = (T_seq > P) ? (T_seq - P + Q - 1) / Q : 0;                                   \
+    const int num_t_chunks = 1 + M_dyn;                                                      \
+                                                                                             \
+    const int z = blockIdx.z;                                                                \
+    const int t_chunk = z % num_t_chunks;                                                    \
+    const int rz = z / num_t_chunks;                                                         \
+    const int da_idx = rz % Da;                                                              \
+    const int r_chunk = rz / Da;                                                             \
+                                                                                             \
+    const unsigned int D = Da * r;                                                           \
+    const unsigned int total_h = NH + 2 * NKVH;                                              \
+    const unsigned int head_stride = D + Da;                                                 \
+                                                                                             \
+    const T_out *h_ptr;                                                                      \
+    const T_out *grad_h_ptr;                                                                 \
+    unsigned int h_loc;                                                                      \
+    int64_t str_h_b, str_h_h, str_h_t, str_h_d;                                              \
+    int64_t str_gh_b, str_gh_h, str_gh_t, str_gh_d;                                          \
+                                                                                             \
+    if (h_glob < NH)                                                                         \
+    {                                                                                        \
+      h_ptr = hq;                                                                            \
+      grad_h_ptr = grad_hq;                                                                  \
+      h_loc = h_glob;                                                                        \
+      str_h_b = str_hq_b;                                                                    \
+      str_h_h = str_hq_h;                                                                    \
+      str_h_t = str_hq_t;                                                                    \
+      str_h_d = str_hq_d;                                                                    \
+      str_gh_b = str_gq_b;                                                                   \
+      str_gh_h = str_gq_h;                                                                   \
+      str_gh_t = str_gq_t;                                                                   \
+      str_gh_d = str_gq_d;                                                                   \
+    }                                                                                        \
+    else if (h_glob < NH + NKVH)                                                             \
+    {                                                                                        \
+      h_ptr = hk;                                                                            \
+      grad_h_ptr = grad_hk;                                                                  \
+      h_loc = h_glob - NH;                                                                   \
+      str_h_b = str_hk_b;                                                                    \
+      str_h_h = str_hk_h;                                                                    \
+      str_h_t = str_hk_t;                                                                    \
+      str_h_d = str_hk_d;                                                                    \
+      str_gh_b = str_gk_b;                                                                   \
+      str_gh_h = str_gk_h;                                                                   \
+      str_gh_t = str_gk_t;                                                                   \
+      str_gh_d = str_gk_d;                                                                   \
+    }                                                                                        \
+    else                                                                                     \
+    {                                                                                        \
+      h_ptr = hv;                                                                            \
+      grad_h_ptr = grad_hv;                                                                  \
+      h_loc = h_glob - (NH + NKVH);                                                          \
+      str_h_b = str_hv_b;                                                                    \
+      str_h_h = str_hv_h;                                                                    \
+      str_h_t = str_hv_t;                                                                    \
+      str_h_d = str_hv_d;                                                                    \
+      str_gh_b = str_gv_b;                                                                   \
+      str_gh_h = str_gv_h;                                                                   \
+      str_gh_t = str_gv_t;                                                                   \
+      str_gh_d = str_gv_d;                                                                   \
+    }                                                                                        \
+                                                                                             \
+    const T_compute bias = logit_bias[h_glob * Da + da_idx];                                 \
+                                                                                             \
+    __shared__ T_compute block_bias_sum;                                                     \
+    if (threadIdx.x == 0)                                                                    \
+    {                                                                                        \
+      block_bias_sum = 0.0f;                                                                 \
+      carry_alpha_cache = T_compute(0);                                                      \
+    }                                                                                        \
+    __syncthreads();                                                                         \
+                                                                                             \
+    if (r_chunk >= num_r_chunks)                                                             \
+      return;                                                                                \
+                                                                                             \
+    const unsigned int val_base = h_glob * head_stride + da_idx * r;                         \
+    const unsigned int logit_base = h_glob * head_stride + D + da_idx;                       \
+    const int64_t b_offset_in = (int64_t)b_idx * sc_in_b;                                    \
+    const int64_t b_offset_out = (int64_t)b_idx * sc_out_b;                                  \
+                                                                                             \
+    int t_len = t_chunk ? Q : P;                                                             \
+    int t_start = P + (t_chunk - 1) * t_len;                                                 \
+    if (t_chunk && t_start >= T_seq)                                                         \
+      return;                                                                                \
+                                                                                             \
+    int t_end = min(t_start + t_len, T_seq);                                                 \
+    int t_suf_end = min(t_end, T_seq - K) + K;                                               \
+    int t_pref_start = max(0, t_start - (K - 1));                                            \
+                                                                                             \
+    const int r_stride = kRThreads * kRItems;                                                \
+    const int r_start = lane_y * kRItems + r_chunk * r_stride;                               \
+                                                                                             \
+    if (lane_x == 0)                                                                         \
+    {                                                                                        \
+      _Pragma("unroll") for (int i = 0; i < kRItems; ++i)                                    \
+          running_x[lane_y * kRItems + i] = T_compute(0);                                    \
+    }                                                                                        \
+    __syncthreads();                                                                         \
+                                                                                             \
+    const int64_t da_r = da_idx * r;                                                         \
+    const int64_t gh_base_invariant =                                                        \
+        (int64_t)b_idx * str_gh_b + (int64_t)h_loc * str_gh_h + da_r * str_gh_d;             \
+    const int64_t h_prev_base_invariant =                                                    \
+        (int64_t)b_idx * str_h_b + (int64_t)h_loc * str_h_h + da_r * str_h_d;                \
+    const int64_t init_base_invariant =                                                      \
+        (int64_t)b_idx * (total_h * D) + (int64_t)h_glob * D + da_r;                         \
+    const int64_t val_in_base_invariant =                                                    \
+        b_offset_in + (int64_t)val_base * sc_in_e;                                           \
+    const int64_t val_out_base_invariant =                                                   \
+        b_offset_out + (int64_t)val_base * sc_out_e;                                         \
+    const int64_t logit_in_base_invariant =                                                  \
+        b_offset_in + (int64_t)logit_base * sc_in_e;                                         \
+                                                                                             \
+    const int partial_idx = lane_y * kScanThreads + lane_x;                                  \
+    const int64_t r_chunk_offset = r_chunk * r_stride;                                       \
+                                                                                             \
+    int t_cur = t_suf_end - 1;                                                               \
+    int t_global_first = t_cur - lane_x;                                                     \
+                                                                                             \
+    int64_t t_gh_base_lane = gh_base_invariant + t_global_first * str_gh_t;                  \
+    int64_t t_h_prev_base_lane = h_prev_base_invariant + (t_global_first - 1) * str_h_t;     \
+    int64_t t_val_in_base_lane = val_in_base_invariant + t_global_first * sc_in_t;           \
+    int64_t t_val_out_base_lane = val_out_base_invariant + t_global_first * sc_out_t;        \
+    int64_t t_logit_in_idx_lane = logit_in_base_invariant + t_global_first * sc_in_t;        \
+                                                                                             \
+    t_val_in_base_lane += r_chunk_offset * sc_in_e;                                          \
+    t_val_out_base_lane += r_chunk_offset * sc_out_e;                                        \
+    t_gh_base_lane += r_chunk_offset * str_gh_d;                                             \
+    t_h_prev_base_lane += r_chunk_offset * str_h_d;                                          \
+                                                                                             \
+    while (t_cur >= t_pref_start)                                                            \
+    {                                                                                        \
+      int chunk_len = min(t_cur - t_pref_start + 1, kScanThreads);                           \
+      bool valid_time = lane_x < chunk_len;                                                  \
+      int t_global = valid_time ? (t_cur - lane_x) : 0;                                      \
+                                                                                             \
+      T_compute d_l_reg = 0.0f;                                                              \
+                                                                                             \
+      T_compute alpha_gate = T_compute(0);                                                   \
+      if (lane_y == 0 && valid_time)                                                         \
+      {                                                                                      \
+        T_compute l_raw = (T_compute)combined[t_logit_in_idx_lane];                          \
+        T_compute logit = l_raw + bias;                                                      \
+        alpha_gate = UseSigmoid ? sigmoid_f32(logit) : logit;                                \
+        shm_alpha_gate[lane_x] = alpha_gate;                                                 \
+      }                                                                                      \
+      __syncthreads();                                                                       \
+                                                                                             \
+      if (valid_time && lane_y != 0)                                                         \
+      {                                                                                      \
+        alpha_gate = shm_alpha_gate[lane_x];                                                 \
+      }                                                                                      \
+                                                                                             \
+      T_compute alpha_next_shfl = __shfl_up_sync(shuffle_mask, alpha_gate, 1, kScanThreads); \
+                                                                                             \
+      T_compute a_next = T_compute(1);                                                       \
+      T_compute a_t_gate = T_compute(1);                                                     \
+      T_compute d_l_multiplier = T_compute(0);                                               \
+                                                                                             \
+      if (valid_time)                                                                        \
+      {                                                                                      \
+        T_compute alpha_next;                                                                \
+        if (lane_x == 0)                                                                     \
+          alpha_next = carry_alpha_cache;                                                    \
+        else                                                                                 \
+          alpha_next = alpha_next_shfl;                                                      \
+                                                                                             \
+        a_next = T_compute(1) - alpha_next;                                                  \
+        a_t_gate = T_compute(1) - alpha_gate;                                                \
+        d_l_multiplier = UseSigmoid ? (alpha_gate * a_t_gate) : T_compute(1);                \
+      }                                                                                      \
+                                                                                             \
+      AffineState<T_compute, kRItems> elem;                                                  \
+      elem.a = valid_time ? a_next : T_compute(1);                                           \
+                                                                                             \
+      int64_t item_gh_idx = t_gh_base_lane + (lane_y * kRItems) * str_gh_d;                  \
+      _Pragma("unroll") for (int item = 0; item < kRItems; ++item)                           \
+      {                                                                                      \
+        int r_idx = r_start + item;                                                          \
+        elem.x[item] = (valid_time && r_idx < r)                                             \
+                           ? (T_compute)grad_h_ptr[item_gh_idx]                              \
+                           : T_compute(0);                                                   \
+        item_gh_idx += str_gh_d;                                                             \
+      }                                                                                      \
+                                                                                             \
+      AffineState<T_compute, kRItems> scan_out;                                              \
+      cub::WarpScan<AffineState<T_compute, kRItems>, kScanThreads>(                          \
+          shared_mem.scan_temp[lane_y])                                                      \
+          .InclusiveScan(elem, scan_out, AffineScanOp<T_compute, kRItems>());                \
+                                                                                             \
+      int64_t item_init_idx = init_base_invariant + r_start;                                 \
+      int64_t item_h_prev_idx = t_h_prev_base_lane + (lane_y * kRItems) * str_h_d;           \
+      int64_t item_val_in_idx = t_val_in_base_lane + (lane_y * kRItems) * sc_in_e;           \
+      int64_t item_val_out_idx = t_val_out_base_lane + (lane_y * kRItems) * sc_out_e;        \
+                                                                                             \
+      bool is_pref_start = (t_global == t_pref_start);                                       \
+                                                                                             \
+      for (int item = 0; item < kRItems; ++item)                                             \
+      {                                                                                      \
+        int r_idx = r_start + item;                                                          \
+        if (r_idx >= r)                                                                      \
+          break;                                                                             \
+        T_compute X_future = running_x[lane_y * kRItems + item];                             \
+        T_compute g = scan_out.a * X_future + scan_out.x[item];                              \
+                                                                                             \
+        bool valid_write = (t_global >= t_start) && (t_global < t_end);                      \
+        if (valid_time)                                                                      \
+        {                                                                                    \
+          T_compute h_prev = is_pref_start ? (T_compute)inits[item_init_idx]                 \
+                                           : (T_compute)h_ptr[item_h_prev_idx];              \
+          T_compute x_val = (T_compute)combined[item_val_in_idx];                            \
+          T_compute d_alpha = (x_val - h_prev) * g;                                          \
+          T_compute d_x = alpha_gate * g;                                                    \
+          T_compute d_l = d_alpha * d_l_multiplier;                                          \
+          if (valid_write)                                                                   \
+          {                                                                                  \
+            grad_combined[item_val_out_idx] = (T_out)d_x;                                    \
+            d_l_reg += d_l;                                                                  \
+          }                                                                                  \
+          if (is_pref_start)                                                                 \
+          {                                                                                  \
+            atomicAdd(&grad_inits_accum[item_init_idx], g * a_t_gate);                       \
+          }                                                                                  \
+        }                                                                                    \
+        if (lane_x == chunk_len - 1)                                                         \
+        {                                                                                    \
+          running_x[lane_y * kRItems + item] = g;                                            \
+        }                                                                                    \
+        item_init_idx += 1;                                                                  \
+        item_h_prev_idx += str_h_d;                                                          \
+        item_val_in_idx += sc_in_e;                                                          \
+        item_val_out_idx += sc_out_e;                                                        \
+      }                                                                                      \
+                                                                                             \
+      __syncthreads();                                                                       \
+      shared_mem.partial_flat[partial_idx] = d_l_reg;                                        \
+      if (lane_y == 0 && lane_x == kScanThreads - 1)                                         \
+      {                                                                                      \
+        carry_alpha_cache = alpha_gate;                                                      \
+      }                                                                                      \
+      __syncthreads();                                                                       \
+                                                                                             \
+      constexpr bool is_pow2 = (kRThreads > 0) && ((kRThreads & (kRThreads - 1)) == 0);      \
+      for (int stride = 1; stride < kRThreads; stride <<= 1)                                 \
+      {                                                                                      \
+        const int offset = stride * kScanThreads;                                            \
+        if ((lane_y & (2 * stride - 1)) == 0)                                                \
+        {                                                                                    \
+          int other = lane_y + stride;                                                       \
+          if (is_pow2 || other < kRThreads)                                                  \
+          {                                                                                  \
+            shared_mem.partial_flat[partial_idx] +=                                          \
+                shared_mem.partial_flat[partial_idx + offset];                               \
+          }                                                                                  \
+        }                                                                                    \
+        __syncthreads();                                                                     \
+      }                                                                                      \
+                                                                                             \
+      if (lane_y == 0 && valid_time)                                                         \
+      {                                                                                      \
+        bool valid_write = (t_global >= t_start) && (t_global < t_end);                      \
+        if (valid_write)                                                                     \
+        {                                                                                    \
+          int64_t accum_idx = (((int64_t)b_idx * total_h + (int64_t)h_glob) * Da +           \
+                               (int64_t)da_idx) *                                            \
+                                  T_seq +                                                    \
+                              (int64_t)t_global;                                             \
+          atomicAdd(&grad_logit_accum[accum_idx], shared_mem.partial_flat[lane_x]);          \
+        }                                                                                    \
+      }                                                                                      \
+                                                                                             \
+      if (threadIdx.x == 0)                                                                  \
+      {                                                                                      \
+        for (int i = 0; i < chunk_len; ++i)                                                  \
+        {                                                                                    \
+          int t = t_cur - i;                                                                 \
+          if (t >= t_start && t < t_end)                                                     \
+            block_bias_sum += shared_mem.partial_flat[i];                                    \
+        }                                                                                    \
+      }                                                                                      \
+      __syncthreads();                                                                       \
+                                                                                             \
+      t_gh_base_lane -= kScanThreads * str_gh_t;                                             \
+      t_h_prev_base_lane -= kScanThreads * str_h_t;                                          \
+      t_val_in_base_lane -= kScanThreads * sc_in_t;                                          \
+      t_val_out_base_lane -= kScanThreads * sc_out_t;                                        \
+      t_logit_in_idx_lane -= kScanThreads * sc_in_t;                                         \
+      t_cur -= kScanThreads;                                                                 \
+    }                                                                                        \
+                                                                                             \
+    if (threadIdx.x == 0)                                                                    \
+    {                                                                                        \
+      const int bias_idx = h_glob * Da + da_idx;                                             \
+      atomicAdd(&grad_logit_bias[bias_idx], block_bias_sum);                                 \
+    }                                                                                        \
   } while (0)
 
 // -------------------------------------------------------------------------
@@ -495,7 +519,7 @@ __global__ void ltv_look_back_fused_concat_cub_backward_kernel_const(
 }
 
 // -------------------------------------------------------------------------
-// Shared memory size helper (unchanged)
+// Shared memory size helper (unchanged layout, added gates/carry cache size)
 // -------------------------------------------------------------------------
 template <typename T_compute, int kScanThreads, int kRThreads, int kRItems>
 constexpr size_t backward_shared_memory_bytes()
@@ -506,7 +530,9 @@ constexpr size_t backward_shared_memory_bytes()
   constexpr size_t size_partial = kRThreads * kScanThreads * sizeof(T_compute);
   constexpr size_t union_size = (size_scan > size_partial) ? size_scan : size_partial;
   constexpr size_t size_running = kRThreads * kRItems * sizeof(T_compute);
-  return union_size + size_running;
+  constexpr size_t size_gates = kScanThreads * sizeof(T_compute); // shm_alpha_gate
+  constexpr size_t size_carry = sizeof(T_compute);                // carry_alpha_cache
+  return union_size + size_running + size_gates + size_carry;
 }
 
 template <typename T_compute, int kScanThreads, int kRThreads, int kRItems>
@@ -766,8 +792,7 @@ void ltv_look_back_backward_dispatch(
     return;                                                                                                               \
   }
 
-  LAUNCH_IF(2147483647, 1, 1, true);
-  LAUNCH_IF(16, 16, 9, true);
+  LTV_LOOK_BACK_LAUNCH_EACH_PQK();
 
   TORCH_CHECK(false, "ltv_look_back_backward: unsupported dispatch configuration. "
                      " P=",

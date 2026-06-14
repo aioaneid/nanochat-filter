@@ -1,9 +1,4 @@
-# tests/test_ltv_cuda_look_back_fused_concat_head_major_register_cast_blelloch_scan.py
-import torch
-import pytest
-import time
-import logging
-
+import torch, pytest, time, logging
 from nanochat.ops.ltv_reference_ops import (
     ltv_look_back_fused_concat_head_major_register_cast_blelloch_scan_minimal,
 )
@@ -26,16 +21,10 @@ def pytest_generate_tests(metafunc):
     add_common_parametrization(metafunc, include_scan_threads=True)
 
 
-def reference_forward(
-    settings, combined, inits, logit_bias, seq_len, da, r, P, Q, K, use_sigmoid
-):
-    """
-    combined: (B, T, F) with arbitrary strides – the original tensor from make_combined_view.
-    The Blelloch reference expects shape (B, F, T). We just transpose (view).
-    """
-    combined_for_ref = combined.transpose(1, 2)  # (B, T, F) -> (B, F, T) view
+def reference_forward(settings, combined, inits, logit_bias, seq_len, da, r, P, Q, K):
+    """combined: (B, T, F) - native layout for this op."""
     return ltv_look_back_fused_concat_head_major_register_cast_blelloch_scan_minimal(
-        combined_for_ref,
+        combined,
         inits,
         logit_bias,
         settings.nh,
@@ -45,7 +34,7 @@ def reference_forward(
         P,
         Q,
         K,
-        use_sigmoid,
+        settings.sigmoid,
     )
 
 
@@ -59,14 +48,12 @@ def test_forward_exact(
 ):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
-
-    P, Q, K, use_sigmoid = pqk_config
+    P, Q, K = pqk_config
     device = torch.device("cuda")
 
     for r in settings.r_values:
         da = settings.total_d // r
-        total_h = settings.total_h
-        total_features = total_h * (da * r + da)
+        total_features = settings.total_h * (da * r + da)
         shape = (settings.batch, seq_len, total_features)
 
         for stride in (
@@ -93,7 +80,6 @@ def test_forward_exact(
                     P,
                     Q,
                     K,
-                    use_sigmoid,
                 )
 
             combined_cuda = torch.as_strided(
@@ -126,7 +112,7 @@ def test_forward_exact(
                             0,
                             0,
                             0,
-                            use_sigmoid,
+                            settings.sigmoid,
                         )
                     )
 
@@ -140,9 +126,9 @@ def test_forward_exact(
                     f"sf={scan_threads_forward}, rf={r_threads_forward}, rif={r_items_forward}"
                 )
                 if settings.check_against_expected:
-                    assert_equal(actual_q, expected_q, "q", case, use_sigmoid)
-                    assert_equal(actual_k, expected_k, "k", case, use_sigmoid)
-                    assert_equal(actual_v, expected_v, "v", case, use_sigmoid)
+                    assert_equal(actual_q, expected_q, "q", case, settings.sigmoid)
+                    assert_equal(actual_k, expected_k, "k", case, settings.sigmoid)
+                    assert_equal(actual_v, expected_v, "v", case, settings.sigmoid)
 
             if settings.benchmark:
                 logger.info(f"Case Forward: {case} time_ns: {end - start:_}")
@@ -161,14 +147,12 @@ def test_backward_exact(
 ):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
-
-    P, Q, K, use_sigmoid = pqk_config
+    P, Q, K = pqk_config
     device = torch.device("cuda")
 
     for r in settings.r_values:
         da = settings.total_d // r
-        total_h = settings.total_h
-        total_features = total_h * (da * r + da)
+        total_features = settings.total_h * (da * r + da)
         shape = (settings.batch, seq_len, total_features)
 
         for stride in (
@@ -182,18 +166,15 @@ def test_backward_exact(
             inits_cpu = make_inits(settings, da, r)
             logit_bias_cpu = make_logit_bias(settings, da, r)
 
-            # Prepare reference tensors with correct shape for gradient tracking
+            # Reference gradients
             if settings.check_against_expected:
-                # Create a copy of the transposed tensor that requires grad
-                combined_for_ref = (
-                    combined_cpu.transpose(1, 2).clone().requires_grad_(True)
-                )
+                combined_ref = combined_cpu.clone().requires_grad_(True)
                 inits_ref = inits_cpu.clone().requires_grad_(True)
                 logit_bias_ref = logit_bias_cpu.clone().requires_grad_(True)
 
                 expected_q, expected_k, expected_v = (
                     ltv_look_back_fused_concat_head_major_register_cast_blelloch_scan_minimal(
-                        combined_for_ref,
+                        combined_ref,
                         inits_ref,
                         logit_bias_ref,
                         settings.nh,
@@ -203,7 +184,7 @@ def test_backward_exact(
                         P,
                         Q,
                         K,
-                        use_sigmoid,
+                        settings.sigmoid,
                     )
                 )
                 grad_q = torch.ones_like(expected_q)
@@ -213,9 +194,8 @@ def test_backward_exact(
                     [expected_q, expected_k, expected_v],
                     [grad_q, grad_k, grad_v],
                 )
-                # Gradients of the reference tensors
-                # combined_for_ref.grad is shape (B, F, T). Transpose back to (B, T, F) for comparison.
-                expected_grad_combined = combined_for_ref.grad.transpose(1, 2)
+                # All gradients are (B, T, F) - no transpose needed
+                expected_grad_combined = combined_ref.grad
                 expected_grad_inits = inits_ref.grad
                 expected_grad_logit_bias = logit_bias_ref.grad
             else:
@@ -260,7 +240,7 @@ def test_backward_exact(
                         scan_threads_backward,
                         r_threads_backward,
                         r_items_backward,
-                        use_sigmoid,
+                        settings.sigmoid,
                     )
                 )
                 torch.autograd.backward(
@@ -285,21 +265,21 @@ def test_backward_exact(
                         expected_grad_combined,
                         "grad_combined",
                         case,
-                        use_sigmoid,
+                        settings.sigmoid,
                     )
                     assert_equal(
                         inits_cuda.grad,
                         expected_grad_inits,
                         "grad_inits",
                         case,
-                        use_sigmoid,
+                        settings.sigmoid,
                     )
                     assert_equal(
                         logit_bias_cuda.grad,
                         expected_grad_logit_bias,
                         "grad_logit_bias",
                         case,
-                        use_sigmoid,
+                        settings.sigmoid,
                     )
 
             if settings.benchmark:
