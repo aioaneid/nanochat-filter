@@ -10,15 +10,15 @@ The pre-trained checkpoints can be found at:
 
 The [training data set and tokenizer](https://huggingface.co/datasets/aioaneid/nanochat.base.240) have been obtained by running [this part](https://github.com/karpathy/nanochat/blob/ae0bf525299633d973d39ecf996edcb48e1fa6f5/speedrun.sh#L1-L76) of the original `speedrun.sh` script with [a bug fix](https://github.com/karpathy/nanochat/pull/429).
 
-In order to train the model in all 4 configuration on Apple MacBook Pro M4 or later, one can download the training data set to `$HOME/.cache/nanochat.base.240`, and then run `train-speedrun.sh`. The training can be monitored via tensorboard like this: `uv run tensorboard --logdir $HOME/.cache/nanochat/nanochat.ltv/logs/nanochat`.
+In order to train the model in all 4 configuration on Apple MacBook Pro M4 or later, one can download the training data set to `$HOME/.cache/nanochat.base.240`, and then run [train-speedrun.sh](train-speedrun.sh). The training can be monitored via tensorboard like this: `uv run tensorboard --logdir $HOME/.cache/nanochat/nanochat.ltv/logs/nanochat`.
 
 Other commands:
 
 * Run all unit tests on Mac: `uv sync --group dev && MATURIN_FEATURES="python,metal" uv pip install --no-build-isolation -e rust_ewma && METAL_DEVICE_CHECK_ERRORS=1 MT_DEVICE_CHECK_ERRORS=1 MTL_DEBUG_LAYER=1 MTL_LOG_ERRORS=1 METAL_DEVICE_WRAPPER_TYPE=0 uv run pytest --log-cli-level=INFO`
-* Run the CUDA unit tests on Nvidia L40S: `modal run scripts/modal_app.py::run_benchmark --mode test-head-major-blelloch --sigmoid`
+* Run the CUDA unit tests on Nvidia L40S: `modal run scripts/modal_app.py::run_benchmark --mode test-head-major-blelloch --no-sigmoid`
 * Run 4 training steps on Nvidia L40S: `modal run scripts/modal_app.py::run_perf_base_train --max-forward-specs 1000 --max-backward-specs 1000`
 
-There is also some limited support for running benchmarks on lightning.ai (see `build_and_upload_run_bench_gpt_ltv.sh`).
+There is also some limited support for running benchmarks and training on lightning.ai in [build_and_upload_run_bench_gpt_ltv.sh](build_and_upload_run_bench_gpt_ltv.sh) and [run_bench_gpt_ltv.sh](run_bench_gpt_ltv.sh).
 
 Code links:
 * The baseline models use [nanochat/concat_qkv_computer.py](nanochat/concat_qkv_computer.py) without a filter.
