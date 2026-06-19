@@ -3,12 +3,12 @@
 This repo is a fork of [NanoChat](https://github.com/karpathy/nanochat) which implements a time-variable low-pass filter of the Q, K and V attention projections.
 
 The pre-trained checkpoints can be found at:
-* [Baseline (d=11)](https://huggingface.co/aioaneid/nanochat_n_layer_12_seq_len_1024_n_embd_1024/tree/main/optimizers/combined/base_checkpoints/d_11-co_true-mt_concat_duplicate_original-r_0-q_none-k_none-v_none-ambi_0-rfb_false-rfi_false)
-* [TVLP (layer-0, d=11)](https://huggingface.co/aioaneid/nanochat_n_layer_12_seq_len_1024_n_embd_1024/tree/main/optimizers/combined/base_checkpoints/d_11-co_true-mt_ltv_fused_concat_register_cast_scan_metal-r_128-q_active-k_active-v_active-ambi_0-rfb_false-rfi_true-ltv_layer_count_1)
-* [TVLP (all layers, d=11)](https://huggingface.co/aioaneid/nanochat_n_layer_12_seq_len_1024_n_embd_1024/tree/main/optimizers/combined/base_checkpoints/d_11-co_true-mt_ltv_fused_concat_duplicate_register_cast_scan_metal-r_128-q_active-k_active-v_active-ambi_0-rfb_false-rfi_true)
-* [Baseline (d=12)](https://huggingface.co/aioaneid/nanochat_n_layer_12_seq_len_1024_n_embd_1024/tree/main/optimizers/combined/base_checkpoints/d_12-co_true-mt_concat_original-r_0-q_none-k_none-v_none-ambi_0-rfb_false-rfi_false)
+* [Baseline (d=11)](https://anonymous-hf.up.railway.app/a/pqz9rgdgsn5g/optimizers/combined/base_checkpoints/d_11-co_true-mt_concat_duplicate_original-r_0-q_none-k_none-v_none-ambi_0-rfb_false-rfi_false)
+* [TVLP (layer-0, d=11)](https://anonymous-hf.up.railway.app/a/pqz9rgdgsn5g/optimizers/combined/base_checkpoints/d_11-co_true-mt_ltv_fused_concat_register_cast_scan_metal-r_128-q_active-k_active-v_active-ambi_0-rfb_false-rfi_true-ltv_layer_count_1)
+* [TVLP (all layers, d=11)](https://anonymous-hf.up.railway.app/a/pqz9rgdgsn5g/optimizers/combined/base_checkpoints/d_11-co_true-mt_ltv_fused_concat_duplicate_register_cast_scan_metal-r_128-q_active-k_active-v_active-ambi_0-rfb_false-rfi_true)
+* [Baseline (d=12)](https://anonymous-hf.up.railway.app/a/pqz9rgdgsn5g/optimizers/combined/base_checkpoints/d_12-co_true-mt_concat_original-r_0-q_none-k_none-v_none-ambi_0-rfb_false-rfi_false)
 
-The [training data set and tokenizer](https://huggingface.co/datasets/aioaneid/nanochat.base.240) have been obtained by running [this part](https://github.com/karpathy/nanochat/blob/ae0bf525299633d973d39ecf996edcb48e1fa6f5/speedrun.sh#L1-L76) of the original `speedrun.sh` script with [a bug fix](https://github.com/karpathy/nanochat/pull/429).
+The [training data set and tokenizer](https://anonymous-hf.up.railway.app/a/ks22v12bd6xr/) have been obtained by running [this part](https://github.com/karpathy/nanochat/blob/ae0bf525299633d973d39ecf996edcb48e1fa6f5/speedrun.sh#L1-L76) of the original `speedrun.sh` script with [a bug fix](https://github.com/karpathy/nanochat/pull/429).
 
 In order to train the model in all 4 configuration on Apple MacBook Pro M4 or later, one can download the training data set to `$HOME/.cache/nanochat.base.240`, and then run [train-speedrun.sh](train-speedrun.sh). The training can be monitored via tensorboard like this: `uv run tensorboard --logdir $HOME/.cache/nanochat/nanochat.ltv/logs/nanochat`.
 
